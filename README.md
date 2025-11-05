@@ -44,6 +44,7 @@ npm run build
    - `repo` (Full control of private repositories)
    - `read:user` (Read access to user profile data)
    - `actions:read` (Read access to actions and workflows)
+   - `read:org` (Read organization membership - required for organization analysis)
 
 ### 2. Set Environment Variable (Recommended)
 
@@ -84,6 +85,12 @@ github-artifacts analyze --include-expired
 # Show top 20 repositories
 github-artifacts analyze --top 20
 
+# Include user repos AND organization repos
+github-artifacts analyze --include-orgs
+
+# Include forked repositories
+github-artifacts analyze --include-forks
+
 # Export to JSON
 github-artifacts analyze --format json --output results.json
 
@@ -92,6 +99,24 @@ github-artifacts analyze --format csv --output results.csv
 
 # Interactive cleanup mode - DELETE artifacts to save space
 github-artifacts analyze --cleanup
+```
+
+### Analyze Organization
+```bash
+# Analyze all repositories in an organization
+github-artifacts analyze-org my-company-org
+
+# Include forked repositories
+github-artifacts analyze-org my-org --include-forks
+
+# Show top 20 repositories
+github-artifacts analyze-org my-org --top 20
+
+# Export to JSON
+github-artifacts analyze-org my-org --format json --output org-results.json
+
+# Interactive cleanup mode for organization
+github-artifacts analyze-org my-org --cleanup
 ```
 
 ### Analyze Specific Repository
@@ -122,6 +147,17 @@ github-artifacts repo shanselman hanselminutes-core --cleanup
 - `--min-size <bytes>`: Minimum artifact size to include in bytes [default: 0]
 - `--top <count>`: Show top N repositories by storage usage [default: 10]
 - `--cleanup`: Interactive cleanup mode - delete artifacts to save space [default: false]
+- `--include-orgs`: Include repositories from user organizations [default: false]
+- `--include-forks`: Include forked repositories [default: false]
+
+#### Analyze Organization Command Options
+- `-f, --format <format>`: Output format (table|json|csv) [default: table]
+- `-o, --output <file>`: Output file path
+- `--include-expired`: Include expired artifacts in analysis [default: false]
+- `--min-size <bytes>`: Minimum artifact size to include in bytes [default: 0]
+- `--top <count>`: Show top N repositories by storage usage [default: 10]
+- `--cleanup`: Interactive cleanup mode - delete artifacts to save space [default: false]
+- `--include-forks`: Include forked repositories [default: false]
 
 #### Repository Command Options
 - `-f, --format <format>`: Output format (table|json|csv) [default: table]
@@ -284,8 +320,14 @@ MIT License - see LICENSE file for details.
 - Check that the repository exists and you have access
 
 **"Access forbidden - check token permissions"**
-- Verify your token has `repo`, `read:user`, and `actions:read` scopes
+- Verify your token has `repo`, `read:user`, `actions:read`, and `read:org` scopes
 - For organization repositories, you might need additional permissions
+- Some organizations require SSO authorization for tokens
+
+**"Organization not found or you don't have access"**
+- Verify you're a member of the organization
+- Ensure token has `read:org` scope
+- Check if organization requires SSO authentication - you may need to authorize your token
 
 **"No artifacts found"**
 - Repository might not have any GitHub Actions workflows
@@ -301,13 +343,13 @@ MIT License - see LICENSE file for details.
 
 ## 📈 Roadmap
 
+- [x] Organization-wide analysis
 - [ ] Bulk artifact deletion functionality
 - [ ] Integration with GitHub CLI
 - [ ] Webhook support for real-time monitoring
 - [ ] Dashboard web interface
 - [ ] Artifact content analysis
 - [ ] Cost estimation features
-- [ ] Organization-wide analysis
 
 ---
 

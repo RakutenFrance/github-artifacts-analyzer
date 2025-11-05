@@ -28,6 +28,8 @@ program
   .option('--min-size <bytes>', 'Minimum artifact size to include (in bytes)', '0')
   .option('--top <count>', 'Show top N repositories by storage usage', '10')
   .option('--cleanup', 'Interactive cleanup mode - delete artifacts to save space', false)
+  .option('--include-orgs', 'Include repositories from user organizations', false)
+  .option('--include-forks', 'Include forked repositories', false)
   .action(async (options) => {
     const token = options.token || process.env.GITHUB_TOKEN;
     if (!token) {
@@ -36,19 +38,34 @@ program
     }
 
     const spinner = ora('Initializing GitHub API...').start();
-    
+
     try {
       const analyzer = new GitHubArtifactsAnalyzer(token);
       const reporter = new ReportGenerator();
 
       spinner.text = 'Fetching repositories...';
-      const analysis = await analyzer.analyzeAllRepositories(
-        options.username,
-        {
-          includeExpired: options.includeExpired,
-          minSize: parseInt(options.minSize),
-        }
-      );
+
+      let analysis;
+      if (options.includeOrgs) {
+        analysis = await analyzer.analyzeAllUserAndOrgRepositories(
+          options.username,
+          {
+            includeExpired: options.includeExpired,
+            minSize: parseInt(options.minSize),
+            includeForks: options.includeForks,
+          }
+        );
+      } else {
+        analysis = await analyzer.analyzeAllRepositories(
+          options.username,
+          {
+            includeExpired: options.includeExpired,
+            minSize: parseInt(options.minSize),
+            excludeOrgs: true,
+            includeForks: options.includeForks,
+          }
+        );
+      }
 
       spinner.succeed('Analysis complete!');
 
@@ -86,7 +103,7 @@ program
     }
 
     const spinner = ora(`Analyzing ${owner}/${repo}...`).start();
-    
+
     try {
       const analyzer = new GitHubArtifactsAnalyzer(token);
       const reporter = new ReportGenerator();
@@ -103,6 +120,57 @@ program
       } else {
         await reporter.generateRepositoryReport(analysis, {
           format: options.format,
+        });
+      }
+
+    } catch (error) {
+      spinner.fail('Analysis failed');
+      console.error(chalk.red('Error:'), error?.message || 'Unknown error');
+      process.exit(1);
+    }
+  });
+
+program
+  .command('analyze-org')
+  .description('Analyze artifacts across all repositories in an organization')
+  .argument('<org>', 'GitHub organization name')
+  .option('-t, --token <token>', 'GitHub Personal Access Token (or set GITHUB_TOKEN env var)')
+  .option('-f, --format <format>', 'Output format (table|json|csv)', 'table')
+  .option('-o, --output <file>', 'Output file path')
+  .option('--include-expired', 'Include expired artifacts in analysis', false)
+  .option('--min-size <bytes>', 'Minimum artifact size to include (in bytes)', '0')
+  .option('--top <count>', 'Show top N repositories by storage usage', '10')
+  .option('--cleanup', 'Interactive cleanup mode - delete artifacts to save space', false)
+  .option('--include-forks', 'Include forked repositories', false)
+  .action(async (org, options) => {
+    const token = options.token || process.env.GITHUB_TOKEN;
+    if (!token) {
+      console.error(chalk.red('Error: GitHub token is required. Use --token or set GITHUB_TOKEN environment variable'));
+      process.exit(1);
+    }
+
+    const spinner = ora(`Analyzing organization: ${org}...`).start();
+
+    try {
+      const analyzer = new GitHubArtifactsAnalyzer(token);
+      const reporter = new ReportGenerator();
+
+      spinner.text = 'Fetching organization repositories...';
+      const analysis = await analyzer.analyzeOrganizationRepositories(org, {
+        includeExpired: options.includeExpired,
+        minSize: parseInt(options.minSize),
+        includeForks: options.includeForks,
+      });
+
+      spinner.succeed('Analysis complete!');
+
+      if (options.cleanup) {
+        await reporter.runCleanupMode(analysis, analyzer);
+      } else {
+        await reporter.generateReport(analysis, {
+          format: options.format,
+          outputFile: options.output,
+          topCount: parseInt(options.top),
         });
       }
 

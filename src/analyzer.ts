@@ -1,5 +1,6 @@
 import { Octokit } from '@octokit/rest';
 import chalk from 'chalk';
+import { AnalysisOptions, OrganizationInfo, RepositoryAnalysis, AnalysisResult, AnalysisSummary } from './types.js';
 
 class GitHubArtifactsAnalyzer {
   private octokit: Octokit;
@@ -10,7 +11,7 @@ class GitHubArtifactsAnalyzer {
     });
   }
 
-  async analyzeAllRepositories(username, options = { includeExpired: false, minSize: 0 }) {
+  async analyzeAllRepositories(username, options: Partial<AnalysisOptions> = { includeExpired: false, minSize: 0, excludeOrgs: true, includeForks: false }) {
     // Get authenticated user if no username provided
     if (!username) {
       const { data: user } = await this.octokit.users.getAuthenticated();
@@ -37,16 +38,27 @@ class GitHubArtifactsAnalyzer {
         if (repos.length === 0) {
           hasMore = false;
         } else {
-          // Filter to only repos owned by the target user (not organizations)
-          const userRepos = repos.filter(repo => 
-            repo.owner.login === username && !repo.fork
-          );
+          // Filter repos based on options
+          const userRepos = repos.filter(repo => {
+            // Check ownership
+            const isOwnedByUser = repo.owner.login === username;
+            const shouldIncludeOrgs = !options.excludeOrgs;
+            const ownershipCheck = isOwnedByUser || shouldIncludeOrgs;
+
+            // Check forks
+            const forkCheck = options.includeForks || !repo.fork;
+
+            return ownershipCheck && forkCheck;
+          });
 
           // Process repositories in batches to avoid rate limiting
           for (const repo of userRepos) {
             console.log(chalk.gray(`  Checking ${repo.full_name}${repo.private ? ' (private)' : ''}...`));
             try {
-              const analysis = await this.analyzeRepository(repo.owner.login, repo.name, options);
+              const analysis = await this.analyzeRepository(repo.owner.login, repo.name, {
+                includeExpired: options.includeExpired ?? false,
+                minSize: options.minSize ?? 0
+              });
               repositories.push(analysis);
               
               if (analysis.totalArtifacts > 0) {
@@ -80,7 +92,7 @@ class GitHubArtifactsAnalyzer {
     };
   }
 
-  async analyzePublicRepositories(username, options = { includeExpired: false, minSize: 0 }) {
+  async analyzePublicRepositories(username, options: Partial<AnalysisOptions> = { includeExpired: false, minSize: 0 }) {
     const repositories = [];
     let page = 1;
     let hasMore = true;
@@ -100,9 +112,12 @@ class GitHubArtifactsAnalyzer {
         for (const repo of repos) {
           console.log(chalk.gray(`  Checking ${repo.full_name}...`));
           try {
-            const analysis = await this.analyzeRepository(repo.owner.login, repo.name, options);
+            const analysis = await this.analyzeRepository(repo.owner.login, repo.name, {
+              includeExpired: options.includeExpired ?? false,
+              minSize: options.minSize ?? 0
+            });
             repositories.push(analysis);
-            
+
             if (analysis.totalArtifacts > 0) {
               console.log(chalk.green(`    ✓ Found ${analysis.totalArtifacts} artifacts (${this.formatBytes(analysis.totalSizeBytes)})`));
             }
@@ -126,7 +141,153 @@ class GitHubArtifactsAnalyzer {
     };
   }
 
-  async analyzeRepository(owner, repo, options = { includeExpired: false, minSize: 0 }) {
+  async listUserOrganizations(): Promise<OrganizationInfo[]> {
+    try {
+      const { data: orgs } = await this.octokit.orgs.listForAuthenticatedUser({
+        per_page: 100
+      });
+
+      return orgs.map(org => ({
+        login: org.login,
+        name: org.login,  // GitHub API doesn't return 'name' for orgs in this endpoint
+        description: org.description || undefined
+      }));
+    } catch (error) {
+      if (error.status === 401) {
+        throw new Error('Authentication failed - check token validity');
+      }
+      throw error;
+    }
+  }
+
+  async analyzeOrganizationRepositories(
+    orgName: string,
+    options: Partial<AnalysisOptions> = {
+      includeExpired: false,
+      minSize: 0,
+      includeForks: false
+    }
+  ): Promise<AnalysisResult> {
+    console.log(chalk.blue(`\n📊 Analyzing organization: ${orgName}\n`));
+
+    const repositories: RepositoryAnalysis[] = [];
+    let page = 1;
+    let hasMore = true;
+
+    while (hasMore) {
+      try {
+        // Fetch organization repositories
+        const { data: repos } = await this.octokit.repos.listForOrg({
+          org: orgName,
+          type: 'all', // all, public, private, forks, sources, member
+          per_page: 100,
+          page,
+          sort: 'updated'
+        });
+
+        if (repos.length === 0) {
+          hasMore = false;
+        } else {
+          // Filter based on options
+          const filteredRepos = repos.filter(repo =>
+            options.includeForks || !repo.fork
+          );
+
+          // Process each repository
+          for (const repo of filteredRepos) {
+            console.log(chalk.gray(`  Checking ${repo.full_name}${repo.private ? ' (private)' : ''}...`));
+
+            try {
+              const analysis = await this.analyzeRepository(
+                repo.owner.login,
+                repo.name,
+                {
+                  includeExpired: options.includeExpired ?? false,
+                  minSize: options.minSize ?? 0
+                }
+              );
+              repositories.push(analysis);
+
+              if (analysis.totalArtifacts > 0) {
+                console.log(chalk.green(
+                  `    ✓ Found ${analysis.totalArtifacts} artifacts (${this.formatBytes(analysis.totalSizeBytes)})`
+                ));
+              }
+            } catch (error) {
+              console.log(chalk.yellow(`    ⚠ Skipped (${error?.message || 'Unknown error'})`));
+            }
+
+            // Rate limit protection
+            await this.sleep(100);
+          }
+          page++;
+        }
+      } catch (error) {
+        if (error.status === 404) {
+          throw new Error(`Organization '${orgName}' not found or you don't have access`);
+        } else if (error.status === 403) {
+          throw new Error('Access forbidden - check token has read:org permission');
+        }
+        throw error;
+      }
+    }
+
+    // Calculate summary
+    const summary = this.calculateSummary(repositories);
+
+    return {
+      organizationName: orgName,
+      repositories,
+      summary
+    };
+  }
+
+  async analyzeAllUserAndOrgRepositories(
+    username: string,
+    options: Partial<AnalysisOptions> = { includeExpired: false, minSize: 0, includeForks: false }
+  ): Promise<AnalysisResult> {
+    // Get user repositories
+    const userAnalysis = await this.analyzeAllRepositories(username, options);
+
+    // Get user's organizations
+    console.log(chalk.blue('\n📊 Fetching user organizations...\n'));
+    const orgs = await this.listUserOrganizations();
+
+    if (orgs.length === 0) {
+      console.log(chalk.yellow('No organizations found for this user.\n'));
+      return userAnalysis;
+    }
+
+    console.log(chalk.blue(`Found ${orgs.length} organization(s): ${orgs.map(o => o.login).join(', ')}\n`));
+
+    // Get org repositories
+    for (const org of orgs) {
+      try {
+        const orgAnalysis = await this.analyzeOrganizationRepositories(org.login, options);
+
+        // Merge org repos into user analysis
+        userAnalysis.repositories.push(...orgAnalysis.repositories);
+      } catch (error) {
+        console.log(chalk.yellow(`  ⚠ Skipped org ${org.login}: ${error.message}`));
+      }
+    }
+
+    // Recalculate summary with all repos
+    userAnalysis.summary = this.calculateSummary(userAnalysis.repositories);
+
+    return userAnalysis;
+  }
+
+  private async checkOrganizationAccess(orgName: string): Promise<boolean> {
+    try {
+      await this.octokit.orgs.get({ org: orgName });
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  async analyzeRepository(owner, repo, options: Partial<AnalysisOptions> = { includeExpired: false, minSize: 0 }) {
     const analysis = {
       owner,
       name: repo,
