@@ -91,6 +91,9 @@ github-artifacts analyze --include-orgs
 # Include forked repositories
 github-artifacts analyze --include-forks
 
+# Add delay between requests to avoid rate limiting (500ms)
+github-artifacts analyze --delay 500
+
 # Export to JSON
 github-artifacts analyze --format json --output results.json
 
@@ -111,6 +114,9 @@ github-artifacts analyze-org my-org --include-forks
 
 # Show top 20 repositories
 github-artifacts analyze-org my-org --top 20
+
+# Add longer delay to avoid rate limiting (1 second)
+github-artifacts analyze-org my-org --delay 1000
 
 # Export to JSON
 github-artifacts analyze-org my-org --format json --output org-results.json
@@ -149,6 +155,7 @@ github-artifacts repo shanselman hanselminutes-core --cleanup
 - `--cleanup`: Interactive cleanup mode - delete artifacts to save space [default: false]
 - `--include-orgs`: Include repositories from user organizations [default: false]
 - `--include-forks`: Include forked repositories [default: false]
+- `--delay <ms>`: Delay in milliseconds between repository checks [default: 100]
 
 #### Analyze Organization Command Options
 - `-f, --format <format>`: Output format (table|json|csv) [default: table]
@@ -158,6 +165,7 @@ github-artifacts repo shanselman hanselminutes-core --cleanup
 - `--top <count>`: Show top N repositories by storage usage [default: 10]
 - `--cleanup`: Interactive cleanup mode - delete artifacts to save space [default: false]
 - `--include-forks`: Include forked repositories [default: false]
+- `--delay <ms>`: Delay in milliseconds between repository checks [default: 100]
 
 #### Repository Command Options
 - `-f, --format <format>`: Output format (table|json|csv) [default: table]
@@ -312,8 +320,11 @@ MIT License - see LICENSE file for details.
 ### Common Issues
 
 **"API rate limit exceeded"**
-- The tool includes built-in rate limiting, but with many repositories, you might hit limits
+- The tool includes built-in rate limiting and exponential backoff
+- If you hit rate limits, increase the delay: `--delay 500` or `--delay 1000`
+- The tool will automatically slow down when detecting consecutive errors
 - Wait and try again, or run the analysis in smaller batches
+- Check your rate limit status: `gh api rate_limit`
 
 **"Repository not found or no access"**
 - Ensure your token has the correct permissions

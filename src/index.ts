@@ -30,6 +30,7 @@ program
   .option('--cleanup', 'Interactive cleanup mode - delete artifacts to save space', false)
   .option('--include-orgs', 'Include repositories from user organizations', false)
   .option('--include-forks', 'Include forked repositories', false)
+  .option('--delay <ms>', 'Delay in milliseconds between repository checks (helps with rate limiting)', '100')
   .action(async (options) => {
     const token = options.token || process.env.GITHUB_TOKEN;
     if (!token) {
@@ -40,7 +41,9 @@ program
     const spinner = ora('Initializing GitHub API...').start();
 
     try {
-      const analyzer = new GitHubArtifactsAnalyzer(token);
+      const analyzer = new GitHubArtifactsAnalyzer(token, {
+        delayMs: parseInt(options.delay)
+      });
       const reporter = new ReportGenerator();
 
       spinner.text = 'Fetching repositories...';
@@ -142,6 +145,7 @@ program
   .option('--top <count>', 'Show top N repositories by storage usage', '10')
   .option('--cleanup', 'Interactive cleanup mode - delete artifacts to save space', false)
   .option('--include-forks', 'Include forked repositories', false)
+  .option('--delay <ms>', 'Delay in milliseconds between repository checks (helps with rate limiting)', '100')
   .action(async (org, options) => {
     const token = options.token || process.env.GITHUB_TOKEN;
     if (!token) {
@@ -152,7 +156,9 @@ program
     const spinner = ora(`Analyzing organization: ${org}...`).start();
 
     try {
-      const analyzer = new GitHubArtifactsAnalyzer(token);
+      const analyzer = new GitHubArtifactsAnalyzer(token, {
+        delayMs: parseInt(options.delay)
+      });
       const reporter = new ReportGenerator();
 
       spinner.text = 'Fetching organization repositories...';

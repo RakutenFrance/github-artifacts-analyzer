@@ -2,13 +2,34 @@ import { Octokit } from '@octokit/rest';
 import chalk from 'chalk';
 import { AnalysisOptions, OrganizationInfo, RepositoryAnalysis, AnalysisResult, AnalysisSummary } from './types.js';
 
+interface AnalyzerConfig {
+  delayMs?: number;
+}
+
 class GitHubArtifactsAnalyzer {
   private octokit: Octokit;
-  constructor(token) {
+  private delayMs: number;
+  private consecutiveErrors: number;
+
+  constructor(token: string, config: AnalyzerConfig = {}) {
     this.octokit = new Octokit({
       auth: token,
       userAgent: 'github-artifacts-analyzer/1.0.0'
     });
+    this.delayMs = config.delayMs ?? 100; // Default 100ms delay
+    this.consecutiveErrors = 0;
+  }
+
+  private async sleepWithBackoff() {
+    // If we've had multiple consecutive errors, increase delay exponentially
+    const backoffMultiplier = Math.min(Math.pow(2, this.consecutiveErrors), 8);
+    const actualDelay = this.delayMs * backoffMultiplier;
+
+    if (backoffMultiplier > 1) {
+      console.log(chalk.yellow(`    ⏱ Slowing down (delay: ${actualDelay}ms) due to errors...`));
+    }
+
+    await this.sleep(actualDelay);
   }
 
   async analyzeAllRepositories(username, options: Partial<AnalysisOptions> = { includeExpired: false, minSize: 0, excludeOrgs: true, includeForks: false }) {
@@ -60,16 +81,24 @@ class GitHubArtifactsAnalyzer {
                 minSize: options.minSize ?? 0
               });
               repositories.push(analysis);
-              
+
               if (analysis.totalArtifacts > 0) {
                 console.log(chalk.green(`    ✓ Found ${analysis.totalArtifacts} artifacts (${this.formatBytes(analysis.totalSizeBytes)})`));
               }
+
+              // Reset error counter on success
+              this.consecutiveErrors = 0;
             } catch (error) {
               console.log(chalk.yellow(`    ⚠ Skipped (${error?.message || 'Unknown error'})`));
+
+              // Increment error counter for rate limit related errors
+              if (error?.status === 403 || error?.status === 429) {
+                this.consecutiveErrors++;
+              }
             }
 
-            // Small delay to be respectful to the API
-            await this.sleep(100);
+            // Delay with exponential backoff if needed
+            await this.sleepWithBackoff();
           }
           page++;
         }
@@ -121,12 +150,20 @@ class GitHubArtifactsAnalyzer {
             if (analysis.totalArtifacts > 0) {
               console.log(chalk.green(`    ✓ Found ${analysis.totalArtifacts} artifacts (${this.formatBytes(analysis.totalSizeBytes)})`));
             }
+
+            // Reset error counter on success
+            this.consecutiveErrors = 0;
           } catch (error) {
             console.log(chalk.yellow(`    ⚠ Skipped (${error?.message || 'Unknown error'})`));
+
+            // Increment error counter for rate limit related errors
+            if (error?.status === 403 || error?.status === 429) {
+              this.consecutiveErrors++;
+            }
           }
 
-          // Small delay to be respectful to the API
-          await this.sleep(100);
+          // Delay with exponential backoff if needed
+          await this.sleepWithBackoff();
         }
         page++;
       }
@@ -213,12 +250,20 @@ class GitHubArtifactsAnalyzer {
                   `    ✓ Found ${analysis.totalArtifacts} artifacts (${this.formatBytes(analysis.totalSizeBytes)})`
                 ));
               }
+
+              // Reset error counter on success
+              this.consecutiveErrors = 0;
             } catch (error) {
               console.log(chalk.yellow(`    ⚠ Skipped (${error?.message || 'Unknown error'})`));
+
+              // Increment error counter for rate limit related errors
+              if (error?.status === 403 || error?.status === 429) {
+                this.consecutiveErrors++;
+              }
             }
 
-            // Rate limit protection
-            await this.sleep(100);
+            // Delay with exponential backoff if needed
+            await this.sleepWithBackoff();
           }
           page++;
         }
