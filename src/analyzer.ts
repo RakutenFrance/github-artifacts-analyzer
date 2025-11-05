@@ -226,7 +226,18 @@ class GitHubArtifactsAnalyzer {
         if (error.status === 404) {
           throw new Error(`Organization '${orgName}' not found or you don't have access`);
         } else if (error.status === 403) {
-          throw new Error('Access forbidden - check token has read:org permission');
+          // 403 on pagination might be rate limiting or SSO auth issue
+          if (page > 1) {
+            console.log(chalk.yellow(`\n⚠ Stopped fetching repositories at page ${page} due to permission error (possibly rate limiting or SSO)`));
+            console.log(chalk.yellow(`Successfully analyzed ${repositories.length} repositories before stopping.\n`));
+            hasMore = false; // Stop pagination but continue with what we have
+            break;
+          }
+          throw new Error('Access forbidden - check token has read:org permission and SSO authorization');
+        } else if (error.status === 429 || error.message?.includes('rate limit')) {
+          console.log(chalk.yellow(`\n⚠ Rate limit reached at page ${page}. Analyzed ${repositories.length} repositories.\n`));
+          hasMore = false;
+          break;
         }
         throw error;
       }
@@ -386,7 +397,7 @@ class GitHubArtifactsAnalyzer {
       if (error?.status === 404) {
         throw new Error('Repository not found or no access');
       } else if (error?.status === 403) {
-        throw new Error('Access forbidden - check token permissions');
+        throw new Error('Access forbidden - token may lack actions:read scope or repo requires SSO authorization');
       } else {
         throw error;
       }
