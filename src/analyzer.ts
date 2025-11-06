@@ -2,21 +2,15 @@ import { Octokit } from '@octokit/rest';
 import chalk from 'chalk';
 import { AnalysisOptions, OrganizationInfo, RepositoryAnalysis, AnalysisResult, AnalysisSummary } from './types.js';
 
-interface AnalyzerConfig {
-  delayMs?: number;
-}
-
 class GitHubArtifactsAnalyzer {
   private octokit: Octokit;
-  private delayMs: number;
   private consecutiveErrors: number;
 
-  constructor(token: string, config: AnalyzerConfig = {}) {
+  constructor(token: string) {
     this.octokit = new Octokit({
       auth: token,
       userAgent: 'github-artifacts-analyzer/1.0.0'
     });
-    this.delayMs = config.delayMs ?? 100; // Default 100ms delay
     this.consecutiveErrors = 0;
   }
 
@@ -53,17 +47,6 @@ class GitHubArtifactsAnalyzer {
     }
   }
 
-  private async sleepWithBackoff() {
-    // If we've had multiple consecutive errors, increase delay exponentially
-    const backoffMultiplier = Math.min(Math.pow(2, this.consecutiveErrors), 8);
-    const actualDelay = this.delayMs * backoffMultiplier;
-
-    if (backoffMultiplier > 1) {
-      console.log(chalk.yellow(`    ⏱ Slowing down (delay: ${actualDelay}ms) due to errors...`));
-    }
-
-    await this.sleep(actualDelay);
-  }
 
   async analyzeAllRepositories(username, options: Partial<AnalysisOptions> = { includeExpired: false, minSize: 0, excludeOrgs: true, includeForks: false }) {
     // Get authenticated user if no username provided
@@ -131,9 +114,6 @@ class GitHubArtifactsAnalyzer {
                 console.log(chalk.yellow(`    ⚠ Skipped (${error?.message || 'Unknown error'})`));
               }
             }
-
-            // Delay with exponential backoff if needed
-            await this.sleepWithBackoff();
           }
           page++;
         }
@@ -196,9 +176,6 @@ class GitHubArtifactsAnalyzer {
               this.consecutiveErrors++;
             }
           }
-
-          // Delay with exponential backoff if needed
-          await this.sleepWithBackoff();
         }
         page++;
       }
@@ -298,9 +275,6 @@ class GitHubArtifactsAnalyzer {
                 console.log(chalk.yellow(`    ⚠ Skipped (${error?.message || 'Unknown error'})`));
               }
             }
-
-            // Delay with exponential backoff if needed
-            await this.sleepWithBackoff();
           }
           page++;
         }

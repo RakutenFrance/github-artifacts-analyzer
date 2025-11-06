@@ -29,7 +29,7 @@ npm run analyze
 npm run start -- repo <owner> <repo>
 
 # Analyze organization (requires read:org scope and SSO auth if applicable)
-npm run start -- analyze-org <org-name> --delay 500
+npm run start -- analyze-org <org-name>
 
 # Analyze user repositories
 npm run start -- analyze --username <username>
@@ -45,12 +45,13 @@ npm run start -- analyze --cleanup
 **1. `analyzer.ts` - GitHubArtifactsAnalyzer class**
 - Main analysis engine that interfaces with GitHub API via Octokit
 - Handles three analysis modes: user repositories, organization repositories, and single repository
-- Implements rate limiting with exponential backoff (see Rate Limiting section)
+- Implements intelligent rate limiting by checking GitHub API status (see Rate Limiting section)
 - Key methods:
   - `analyzeRepository()`: Core artifact analysis for a single repo
   - `analyzeAllRepositories()`: Scans all user repositories
   - `analyzeOrganizationRepositories()`: Scans all org repositories
-  - `sleepWithBackoff()`: Implements exponential backoff based on `consecutiveErrors` counter
+  - `checkRateLimit()`: Queries GitHub API for current rate limit status
+  - `waitForRateLimit()`: Waits until rate limit resets if needed
 
 **2. `reporter.ts` - ReportGenerator class**
 - Handles all output formatting (table, JSON, CSV)
@@ -72,18 +73,15 @@ npm run start -- analyze --cleanup
 
 ### Rate Limiting Architecture
 
-The tool implements a sophisticated rate limiting system to handle GitHub API constraints:
+The tool implements intelligent rate limiting by checking the GitHub API status:
 
-- **Configurable base delay**: Set via `--delay` option (default 100ms)
-- **Exponential backoff**: Automatically increases delay when consecutive errors occur:
-  - 0 errors: normal delay
-  - 1-2 errors: 2x delay
-  - 3-4 errors: 4x delay
-  - 5+ errors: 8x delay (max)
-- **Error tracking**: `consecutiveErrors` counter in analyzer resets on success
-- **Error detection**: Monitors for 403/429 status codes (rate limiting and permission errors)
+- **Automatic detection**: When a 403 or 429 error occurs, checks actual rate limit status via GitHub API
+- **Smart waiting**: If rate limited, calculates exact wait time until reset
+- **Clear feedback**: Displays messages showing reset time and wait duration
+- **Automatic resumption**: Continues operations once rate limit resets
+- **Error tracking**: `consecutiveErrors` counter distinguishes rate limits from permission errors
 
-When analyzing organizations with many repositories, use `--delay 500` or `--delay 1000` to avoid hitting rate limits.
+The tool automatically handles rate limiting without requiring manual delay configuration.
 
 ### GitHub API Integration
 
@@ -112,18 +110,19 @@ When analyzing organizations with many repositories, use `--delay 500` or `--del
 
 **CRITICAL**: This project uses TypeScript with ES modules. Always run `npm run build` after making changes to `src/` files. The compiled JavaScript in `dist/` is what actually executes.
 
-### Rate Limit Debugging
+### Rate Limit Handling
 
-If you encounter "Access forbidden" errors during organization analysis:
+The tool automatically detects and handles rate limiting:
 
-1. Check if it's actually rate limiting (not permissions):
-   ```bash
-   gh api rate_limit
-   ```
+1. When a rate limit is hit, the tool checks the GitHub API status
+2. It displays a message: "⏳ Rate limit exceeded. Waiting until [time] (X minutes)..."
+3. The tool pauses until the rate limit resets
+4. Operations automatically resume with: "✓ Rate limit reset. Resuming operations..."
 
-2. Look for `remaining: 0` in the output - this means rate limited, NOT a permission error
-
-3. The error message at `src/analyzer.ts:281` can be misleading when rate limited
+If you want to manually check rate limits:
+```bash
+gh api rate_limit
+```
 
 ### Cleanup Mode
 
