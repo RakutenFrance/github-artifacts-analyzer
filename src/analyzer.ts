@@ -20,6 +20,39 @@ class GitHubArtifactsAnalyzer {
     this.consecutiveErrors = 0;
   }
 
+  private async checkRateLimit(): Promise<{ limited: boolean; resetAt?: Date; remaining?: number }> {
+    try {
+      const { data: rateLimit } = await this.octokit.rateLimit.get();
+      const core = rateLimit.resources.core;
+
+      return {
+        limited: core.remaining === 0,
+        resetAt: new Date(core.reset * 1000),
+        remaining: core.remaining
+      };
+    } catch (error) {
+      // If we can't check rate limits, assume not limited
+      return { limited: false };
+    }
+  }
+
+  private async waitForRateLimit() {
+    const rateLimitStatus = await this.checkRateLimit();
+
+    if (rateLimitStatus.limited && rateLimitStatus.resetAt) {
+      const now = new Date();
+      const waitMs = rateLimitStatus.resetAt.getTime() - now.getTime();
+
+      if (waitMs > 0) {
+        const waitMinutes = Math.ceil(waitMs / 60000);
+        console.log(chalk.yellow(`\n⏳ Rate limit exceeded. Waiting until ${rateLimitStatus.resetAt.toLocaleTimeString()} (${waitMinutes} minute${waitMinutes !== 1 ? 's' : ''})...`));
+        await this.sleep(waitMs + 1000); // Add 1 second buffer
+        console.log(chalk.green(`✓ Rate limit reset. Resuming operations...\n`));
+        this.consecutiveErrors = 0; // Reset error counter after waiting
+      }
+    }
+  }
+
   private async sleepWithBackoff() {
     // If we've had multiple consecutive errors, increase delay exponentially
     const backoffMultiplier = Math.min(Math.pow(2, this.consecutiveErrors), 8);
@@ -89,11 +122,13 @@ class GitHubArtifactsAnalyzer {
               // Reset error counter on success
               this.consecutiveErrors = 0;
             } catch (error) {
-              console.log(chalk.yellow(`    ⚠ Skipped (${error?.message || 'Unknown error'})`));
-
-              // Increment error counter for rate limit related errors
+              // Check if this is a rate limit error
               if (error?.status === 403 || error?.status === 429) {
                 this.consecutiveErrors++;
+                console.log(chalk.yellow(`    ⚠ Error detected (${error?.message || 'Unknown error'})`));
+                await this.waitForRateLimit();
+              } else {
+                console.log(chalk.yellow(`    ⚠ Skipped (${error?.message || 'Unknown error'})`));
               }
             }
 
@@ -254,11 +289,13 @@ class GitHubArtifactsAnalyzer {
               // Reset error counter on success
               this.consecutiveErrors = 0;
             } catch (error) {
-              console.log(chalk.yellow(`    ⚠ Skipped (${error?.message || 'Unknown error'})`));
-
-              // Increment error counter for rate limit related errors
+              // Check if this is a rate limit error
               if (error?.status === 403 || error?.status === 429) {
                 this.consecutiveErrors++;
+                console.log(chalk.yellow(`    ⚠ Error detected (${error?.message || 'Unknown error'})`));
+                await this.waitForRateLimit();
+              } else {
+                console.log(chalk.yellow(`    ⚠ Skipped (${error?.message || 'Unknown error'})`));
               }
             }
 
@@ -270,19 +307,18 @@ class GitHubArtifactsAnalyzer {
       } catch (error) {
         if (error.status === 404) {
           throw new Error(`Organization '${orgName}' not found or you don't have access`);
-        } else if (error.status === 403) {
-          // 403 on pagination might be rate limiting or SSO auth issue
+        } else if (error.status === 403 || error.status === 429 || error.message?.includes('rate limit')) {
+          // Check if we're actually rate limited
+          console.log(chalk.yellow(`\n⚠ Error at page ${page}: ${error.message || 'Permission or rate limit error'}`));
+          await this.waitForRateLimit();
+
+          // If it's still failing after waiting (e.g., actual permission issue), stop pagination
           if (page > 1) {
-            console.log(chalk.yellow(`\n⚠ Stopped fetching repositories at page ${page} due to permission error (possibly rate limiting or SSO)`));
             console.log(chalk.yellow(`Successfully analyzed ${repositories.length} repositories before stopping.\n`));
-            hasMore = false; // Stop pagination but continue with what we have
+            hasMore = false;
             break;
           }
           throw new Error('Access forbidden - check token has read:org permission and SSO authorization');
-        } else if (error.status === 429 || error.message?.includes('rate limit')) {
-          console.log(chalk.yellow(`\n⚠ Rate limit reached at page ${page}. Analyzed ${repositories.length} repositories.\n`));
-          hasMore = false;
-          break;
         }
         throw error;
       }
