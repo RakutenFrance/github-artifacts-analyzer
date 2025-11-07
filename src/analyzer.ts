@@ -10,6 +10,43 @@ class GitHubArtifactsAnalyzer {
     });
   }
 
+  private async checkRateLimit() {
+    try {
+      const { data: rateLimit } = await this.octokit.rateLimit.get();
+      const core = rateLimit.resources.core;
+
+      return {
+        limited: core.remaining === 0,
+        resetAt: new Date(core.reset * 1000),
+        remaining: core.remaining
+      };
+    } catch (error) {
+      // If we can't check rate limits, assume not limited
+      return { limited: false };
+    }
+  }
+
+  private async checkAndWaitIfNearLimit(threshold = 500) {
+    const rateLimitStatus = await this.checkRateLimit();
+
+    if (rateLimitStatus.remaining !== undefined &&
+        rateLimitStatus.remaining <= threshold &&
+        rateLimitStatus.resetAt) {
+      const now = new Date();
+      const waitMs = rateLimitStatus.resetAt.getTime() - now.getTime();
+
+      if (waitMs > 0) {
+        const waitMinutes = Math.ceil(waitMs / 60000);
+        console.log(chalk.yellow(
+          `\n⏳ Rate limit low (${rateLimitStatus.remaining} requests remaining). ` +
+          `Waiting until ${rateLimitStatus.resetAt.toLocaleTimeString()} (${waitMinutes} minute${waitMinutes !== 1 ? 's' : ''})...`
+        ));
+        await this.sleep(waitMs + 1000); // Add 1 second buffer
+        console.log(chalk.green(`✓ Rate limit reset. Resuming operations...\n`));
+      }
+    }
+  }
+
   async analyzeAllRepositories(username, options = { includeExpired: false, minSize: 0 }) {
     // Get authenticated user if no username provided
     if (!username) {
@@ -44,6 +81,9 @@ class GitHubArtifactsAnalyzer {
 
           // Process repositories in batches to avoid rate limiting
           for (const repo of userRepos) {
+            // Proactively check rate limit before processing each repository
+            await this.checkAndWaitIfNearLimit();
+
             console.log(chalk.gray(`  Checking ${repo.full_name}${repo.private ? ' (private)' : ''}...`));
             try {
               const analysis = await this.analyzeRepository(repo.owner.login, repo.name, options);
@@ -98,6 +138,9 @@ class GitHubArtifactsAnalyzer {
       } else {
         // Process repositories in batches to avoid rate limiting
         for (const repo of repos) {
+          // Proactively check rate limit before processing each repository
+          await this.checkAndWaitIfNearLimit();
+
           console.log(chalk.gray(`  Checking ${repo.full_name}...`));
           try {
             const analysis = await this.analyzeRepository(repo.owner.login, repo.name, options);
