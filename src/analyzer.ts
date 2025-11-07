@@ -26,7 +26,7 @@ class GitHubArtifactsAnalyzer {
     }
   }
 
-  private async checkAndWaitIfNearLimit(threshold = 500) {
+  private async checkAndWaitIfNearLimit(threshold = 1000) {
     const rateLimitStatus = await this.checkRateLimit();
 
     if (rateLimitStatus.remaining !== undefined &&
@@ -95,9 +95,6 @@ class GitHubArtifactsAnalyzer {
             } catch (error) {
               console.log(chalk.yellow(`    ⚠ Skipped (${error?.message || 'Unknown error'})`));
             }
-
-            // Small delay to be respectful to the API
-            await this.sleep(100);
           }
           page++;
         }
@@ -152,9 +149,6 @@ class GitHubArtifactsAnalyzer {
           } catch (error) {
             console.log(chalk.yellow(`    ⚠ Skipped (${error?.message || 'Unknown error'})`));
           }
-
-          // Small delay to be respectful to the API
-          await this.sleep(100);
         }
         page++;
       }
@@ -201,6 +195,9 @@ class GitHubArtifactsAnalyzer {
 
           // Process each repository
           for (const repo of filteredRepos) {
+            // Proactively check rate limit before processing each repository
+            await this.checkAndWaitIfNearLimit();
+
             console.log(chalk.gray(`  Checking ${repo.full_name}${repo.private ? ' (private)' : ''}...`));
 
             try {
@@ -222,9 +219,6 @@ class GitHubArtifactsAnalyzer {
             } catch (error) {
               console.log(chalk.yellow(`    ⚠ Skipped (${error?.message || 'Unknown error'})`));
             }
-
-            // Rate limit protection
-            await this.sleep(100);
           }
           page++;
         }
