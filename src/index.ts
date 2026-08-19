@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import * as dotenv from 'dotenv';
-import { Command } from 'commander';
+import { Command, InvalidArgumentError } from 'commander';
 import { GitHubArtifactsAnalyzer } from './analyzer.js';
 import { ReportGenerator } from './reporter.js';
 import chalk from 'chalk';
@@ -10,6 +10,13 @@ import { pathToFileURL } from 'url';
 
 // Load environment variables from .env file
 dotenv.config();
+
+function parseNonNegativeInteger(value) {
+  if (!/^\d+$/.test(value)) {
+    throw new InvalidArgumentError('must be a non-negative integer.');
+  }
+  return parseInt(value, 10);
+}
 
 const program = new Command();
 
@@ -26,8 +33,8 @@ program
   .option('-f, --format <format>', 'Output format (table|json|csv)', 'table')
   .option('-o, --output <file>', 'Output file path')
   .option('--include-expired', 'Include expired artifacts in analysis', false)
-  .option('--min-size <bytes>', 'Minimum artifact size to include (in bytes)', '0')
-  .option('--top <count>', 'Show top N repositories by storage usage', '10')
+  .option('--min-size <bytes>', 'Minimum artifact size to include (in bytes)', parseNonNegativeInteger, 0)
+  .option('--top <count>', 'Show top N repositories by storage usage', parseNonNegativeInteger, 10)
   .option('--cleanup', 'Interactive cleanup mode - delete artifacts to save space', false)
   .action(async (options) => {
     const token = options.token || process.env.GITHUB_TOKEN;
@@ -48,7 +55,7 @@ program
         options.username,
         {
           includeExpired: options.includeExpired,
-          minSize: parseInt(options.minSize),
+          minSize: options.minSize,
         }
       );
 
@@ -60,7 +67,7 @@ program
         await reporter.generateReport(analysis, {
           format: options.format,
           outputFile: options.output,
-          topCount: parseInt(options.top),
+          topCount: options.top,
         });
       }
 
@@ -123,8 +130,8 @@ program
   .option('-f, --format <format>', 'Output format (table|json|csv)', 'table')
   .option('-o, --output <file>', 'Output file path')
   .option('--include-expired', 'Include expired artifacts in analysis', false)
-  .option('--min-size <bytes>', 'Minimum artifact size to include (in bytes)', '0')
-  .option('--top <count>', 'Show top N repositories by storage usage', '10')
+  .option('--min-size <bytes>', 'Minimum artifact size to include (in bytes)', parseNonNegativeInteger, 0)
+  .option('--top <count>', 'Show top N repositories by storage usage', parseNonNegativeInteger, 10)
   .option('--cleanup', 'Interactive cleanup mode - delete artifacts to save space', false)
   .action(async (org, options) => {
     const token = options.token || process.env.GITHUB_TOKEN;
@@ -142,7 +149,7 @@ program
       spinner.text = 'Fetching organization repositories...';
       const analysis = await analyzer.analyzeOrganizationRepositories(org, {
         includeExpired: options.includeExpired,
-        minSize: parseInt(options.minSize),
+        minSize: options.minSize,
       });
 
       spinner.succeed('Analysis complete!');
@@ -153,7 +160,7 @@ program
         await reporter.generateReport(analysis, {
           format: options.format,
           outputFile: options.output,
-          topCount: parseInt(options.top),
+          topCount: options.top,
         });
       }
 
