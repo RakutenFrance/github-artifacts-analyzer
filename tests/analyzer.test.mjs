@@ -94,13 +94,24 @@ test('attributes each artifact to its workflow name via the run lookup', async (
 });
 
 test('marks a repository incomplete when the workflow run lookup fails', async () => {
+  let artifactsPage = 0;
   const analyzer = createAnalyzer({
     actions: {
       listRepoWorkflows: async () => ({ data: workflowFixture() }),
       listWorkflowRunsForRepo: async () => {
         throw Object.assign(new Error('SSO authorization required'), { status: 403 });
       },
-      listArtifactsForRepo: async () => ({ data: [] }),
+      // At least one artifact must be found, or the run lookup this test
+      // targets is skipped entirely (nothing to attribute a name to).
+      listArtifactsForRepo: async () => ({
+        data: artifactsPage++ === 0
+          ? [{
+            id: 1, name: 'build-output', size_in_bytes: 10, expired: false,
+            created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z', expires_at: '2027-01-01T00:00:00Z',
+            workflow_run: { id: 100 },
+          }]
+          : [],
+      }),
     },
   });
 
@@ -331,6 +342,38 @@ test('records fewer API calls per repo with the repo-level artifact/run scheme',
     listRepoWorkflows: 2,
     listWorkflowRunsForRepo: 4,   // 2 repos * (1 page of data + 1 empty page)
     listArtifactsForRepo: 4,      // 2 repos * (1 page of data + 1 empty page)
+  });
+});
+
+test('skips the run-history pagination entirely for a repo with workflows but no artifacts', async () => {
+  const counts = {};
+  const count = (name) => { counts[name] = (counts[name] || 0) + 1; };
+
+  const analyzer = createAnalyzer({
+    actions: {
+      listRepoWorkflows: async () => {
+        count('listRepoWorkflows');
+        return { data: workflowFixture() };
+      },
+      // Simulates a repo with a long run history (many pages) but no
+      // surviving artifacts - this pagination should never be reached.
+      listWorkflowRunsForRepo: async () => {
+        count('listWorkflowRunsForRepo');
+        return { data: [{ id: 1, workflow_id: 10 }] };
+      },
+      listArtifactsForRepo: async () => {
+        count('listArtifactsForRepo');
+        return { data: [] };
+      },
+    },
+  });
+
+  const analysis = await analyzer.analyzeRepository('owner', 'repo');
+
+  assert.equal(analysis.totalArtifacts, 0);
+  assert.deepEqual(counts, {
+    listRepoWorkflows: 1,
+    listArtifactsForRepo: 1,
   });
 });
 

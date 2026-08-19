@@ -55,9 +55,43 @@ class GitHubArtifactsAnalyzer {
     analysis.warnings.push(message);
   }
 
+  // Paginates all artifacts for the repo directly, instead of listing runs per
+  // workflow and artifacts per run - the O(runs) request cost this replaces.
+  private async collectRepositoryArtifacts(owner, repo, options, analysis) {
+    try {
+      for await (const { data: artifacts } of this.octokit.paginate.iterator(
+        this.octokit.actions.listArtifactsForRepo,
+        { owner, repo, per_page: 100 }
+      )) {
+        for (const artifact of artifacts) {
+          if (artifact.size_in_bytes < options.minSize) continue;
+
+          const isExpired = artifact.expired || (artifact.expires_at ? new Date(artifact.expires_at) < new Date() : false);
+          if (isExpired && !options.includeExpired) continue;
+
+          analysis.artifacts.push({
+            id: artifact.id,
+            name: artifact.name,
+            sizeInBytes: artifact.size_in_bytes,
+            createdAt: new Date(artifact.created_at || Date.now()),
+            updatedAt: new Date(artifact.updated_at || Date.now()),
+            expiresAt: new Date(artifact.expires_at || Date.now()),
+            expired: isExpired,
+            workflowRunId: artifact.workflow_run?.id ?? null,
+            workflowName: 'Unknown'
+          });
+        }
+      }
+    } catch (error) {
+      this.recordWarning(analysis, `Artifact listing: ${this.describeError(error)}`);
+    }
+  }
+
   // Paginates all workflow runs for the repo once (instead of once per workflow)
-  // to build a run_id -> workflow name lookup for artifact attribution.
-  private async buildWorkflowNameLookup(owner, repo, analysis) {
+  // to build a run_id -> workflow name lookup, then labels the artifacts already
+  // collected. Only called when there's at least one artifact to attribute, so
+  // a repo with no surviving artifacts skips this run-history pagination entirely.
+  private async attributeWorkflowNames(owner, repo, analysis) {
     const workflowNameById = new Map(analysis.workflows.map(w => [w.id, w.name]));
     const workflowNameByRunId = new Map();
 
@@ -72,41 +106,11 @@ class GitHubArtifactsAnalyzer {
       }
     } catch (error) {
       this.recordWarning(analysis, `Workflow run lookup: ${this.describeError(error)}`);
+      return;
     }
 
-    return workflowNameByRunId;
-  }
-
-  // Paginates all artifacts for the repo directly, instead of listing runs per
-  // workflow and artifacts per run - the O(runs) request cost this replaces.
-  private async collectRepositoryArtifacts(owner, repo, options, analysis, workflowNameByRunId) {
-    try {
-      for await (const { data: artifacts } of this.octokit.paginate.iterator(
-        this.octokit.actions.listArtifactsForRepo,
-        { owner, repo, per_page: 100 }
-      )) {
-        for (const artifact of artifacts) {
-          if (artifact.size_in_bytes < options.minSize) continue;
-
-          const isExpired = artifact.expired || (artifact.expires_at ? new Date(artifact.expires_at) < new Date() : false);
-          if (isExpired && !options.includeExpired) continue;
-
-          const runId = artifact.workflow_run?.id ?? null;
-          analysis.artifacts.push({
-            id: artifact.id,
-            name: artifact.name,
-            sizeInBytes: artifact.size_in_bytes,
-            createdAt: new Date(artifact.created_at || Date.now()),
-            updatedAt: new Date(artifact.updated_at || Date.now()),
-            expiresAt: new Date(artifact.expires_at || Date.now()),
-            expired: isExpired,
-            workflowRunId: runId,
-            workflowName: workflowNameByRunId.get(runId) || 'Unknown'
-          });
-        }
-      }
-    } catch (error) {
-      this.recordWarning(analysis, `Artifact listing: ${this.describeError(error)}`);
+    for (const artifact of analysis.artifacts) {
+      artifact.workflowName = workflowNameByRunId.get(artifact.workflowRunId) || 'Unknown';
     }
   }
 
@@ -301,10 +305,12 @@ class GitHubArtifactsAnalyzer {
         state: w.state
       }));
 
-      // One pagination pass over all runs (for workflow-name attribution) and
-      // one over all artifacts, instead of one artifacts call per run.
-      const workflowNameByRunId = await this.buildWorkflowNameLookup(owner, repo, analysis);
-      await this.collectRepositoryArtifacts(owner, repo, options, analysis, workflowNameByRunId);
+      // Collect artifacts first, then only pay for the run-history pagination
+      // needed to attribute workflow names if there's actually something to label.
+      await this.collectRepositoryArtifacts(owner, repo, options, analysis);
+      if (analysis.artifacts.length > 0) {
+        await this.attributeWorkflowNames(owner, repo, analysis);
+      }
 
       // Calculate statistics
       analysis.totalArtifacts = analysis.artifacts.length;
