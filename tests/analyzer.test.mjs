@@ -262,6 +262,52 @@ test('skips an organization repository that fails without aborting the scan', as
 
   assert.deepEqual(analysis.repositories.map(r => r.fullName), ['my-org/ok']);
   assert.equal(analysis.summary.totalRepositories, 1);
+  assert.equal(analysis.incomplete, true);
+  assert.equal(analysis.summary.repositoriesSkipped, 1);
+  assert.deepEqual(analysis.skippedRepositories, [
+    { fullName: 'my-org/broken', reason: 'Repository not found or no access' },
+  ]);
+});
+
+test('tracks every organization repository failure instead of reporting a falsely complete summary', async () => {
+  let repoPage = 0;
+  const analyzer = createAnalyzer({
+    repos: {
+      listForOrg: async () => ({
+        data: repoPage++ === 0
+          ? [
+            { full_name: 'my-org/rate-limited', owner: { login: 'my-org' }, name: 'rate-limited', fork: false, private: false },
+            { full_name: 'my-org/no-access', owner: { login: 'my-org' }, name: 'no-access', fork: false, private: true },
+            { full_name: 'my-org/ok', owner: { login: 'my-org' }, name: 'ok', fork: false, private: false },
+          ]
+          : [],
+      }),
+    },
+    actions: {
+      listRepoWorkflows: async ({ repo }) => {
+        if (repo === 'rate-limited') {
+          throw Object.assign(new Error('API rate limit exceeded'), {
+            status: 403,
+            response: { headers: { 'x-ratelimit-remaining': '0' } },
+          });
+        }
+        if (repo === 'no-access') {
+          throw Object.assign(new Error('Forbidden'), { status: 403 });
+        }
+        return { data: { total_count: 0, workflows: [] } };
+      },
+    },
+  });
+
+  const analysis = await analyzer.analyzeOrganizationRepositories('my-org');
+
+  assert.equal(analysis.incomplete, true);
+  assert.equal(analysis.summary.totalRepositories, 1);
+  assert.equal(analysis.summary.repositoriesSkipped, 2);
+  assert.deepEqual(
+    analysis.skippedRepositories.map(r => r.fullName).sort(),
+    ['my-org/no-access', 'my-org/rate-limited']
+  );
 });
 
 test('reports a clear error when the organization is not found or inaccessible', async () => {

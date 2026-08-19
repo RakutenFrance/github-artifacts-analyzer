@@ -50,6 +50,52 @@ class GitHubArtifactsAnalyzer {
     return error?.message || 'Unknown error';
   }
 
+  // Analyzes a batch of repositories, tracking per-repository failures instead
+  // of swallowing them, so every caller reports skipped/incomplete repositories
+  // explicitly rather than finishing with a silently partial summary.
+  private async analyzeRepositoryBatch(repos, options) {
+    const repositories = [];
+    const skippedRepositories = [];
+
+    for (const repo of repos) {
+      this.warnIfQuotaLow();
+      console.log(chalk.gray(`  Checking ${repo.full_name}${repo.private ? ' (private)' : ''}...`));
+      try {
+        const analysis = await this.analyzeRepository(repo.owner.login, repo.name, options);
+        repositories.push(analysis);
+
+        if (analysis.totalArtifacts > 0) {
+          console.log(chalk.green(`    ✓ Found ${analysis.totalArtifacts} artifacts (${this.formatBytes(analysis.totalSizeBytes)})`));
+        }
+      } catch (error) {
+        const reason = this.describeError(error);
+        skippedRepositories.push({ fullName: repo.full_name, reason });
+        console.log(chalk.yellow(`    ⚠ Skipped (${reason})`));
+      }
+
+      // Small delay to be respectful to the API
+      await this.sleep(100);
+    }
+
+    return { repositories, skippedRepositories };
+  }
+
+  private buildAnalysisResult(repositories, skippedRepositories, extra = {}) {
+    const summary = this.calculateSummary(repositories, skippedRepositories);
+    const incompleteRepositories = repositories
+      .filter(repo => repo.incomplete)
+      .map(repo => ({ fullName: repo.fullName, warnings: repo.warnings }));
+
+    return {
+      ...extra,
+      repositories,
+      summary,
+      incomplete: skippedRepositories.length > 0 || incompleteRepositories.length > 0,
+      skippedRepositories,
+      incompleteRepositories
+    };
+  }
+
   async analyzeAllRepositories(username, options = { includeExpired: false, minSize: 0 }) {
     // Get authenticated user if no username provided
     if (!username) {
@@ -83,26 +129,9 @@ class GitHubArtifactsAnalyzer {
             repo.owner.login === username && !repo.fork
           );
 
-          // Process repositories in batches to avoid rate limiting
-          for (const repo of userRepos) {
-            this.warnIfQuotaLow();
-            console.log(chalk.gray(`  Checking ${repo.full_name}${repo.private ? ' (private)' : ''}...`));
-            try {
-              const analysis = await this.analyzeRepository(repo.owner.login, repo.name, options);
-              repositories.push(analysis);
-
-              if (analysis.totalArtifacts > 0) {
-                console.log(chalk.green(`    ✓ Found ${analysis.totalArtifacts} artifacts (${this.formatBytes(analysis.totalSizeBytes)})`));
-              }
-            } catch (error) {
-              const reason = this.describeError(error);
-              skippedRepositories.push({ fullName: repo.full_name, reason });
-              console.log(chalk.yellow(`    ⚠ Skipped (${reason})`));
-            }
-
-            // Small delay to be respectful to the API
-            await this.sleep(100);
-          }
+          const batch = await this.analyzeRepositoryBatch(userRepos, options);
+          repositories.push(...batch.repositories);
+          skippedRepositories.push(...batch.skippedRepositories);
           page++;
         }
       } catch (error) {
@@ -115,19 +144,7 @@ class GitHubArtifactsAnalyzer {
       }
     }
 
-    // Calculate summary statistics
-    const summary = this.calculateSummary(repositories, skippedRepositories);
-    const incompleteRepositories = repositories
-      .filter(repo => repo.incomplete)
-      .map(repo => ({ fullName: repo.fullName, warnings: repo.warnings }));
-
-    return {
-      repositories,
-      summary,
-      incomplete: skippedRepositories.length > 0 || incompleteRepositories.length > 0,
-      skippedRepositories,
-      incompleteRepositories
-    };
+    return this.buildAnalysisResult(repositories, skippedRepositories);
   }
 
   async analyzePublicRepositories(username, options = { includeExpired: false, minSize: 0 }) {
@@ -147,43 +164,14 @@ class GitHubArtifactsAnalyzer {
       if (repos.length === 0) {
         hasMore = false;
       } else {
-        // Process repositories in batches to avoid rate limiting
-        for (const repo of repos) {
-          this.warnIfQuotaLow();
-          console.log(chalk.gray(`  Checking ${repo.full_name}...`));
-          try {
-            const analysis = await this.analyzeRepository(repo.owner.login, repo.name, options);
-            repositories.push(analysis);
-
-            if (analysis.totalArtifacts > 0) {
-              console.log(chalk.green(`    ✓ Found ${analysis.totalArtifacts} artifacts (${this.formatBytes(analysis.totalSizeBytes)})`));
-            }
-          } catch (error) {
-            const reason = this.describeError(error);
-            skippedRepositories.push({ fullName: repo.full_name, reason });
-            console.log(chalk.yellow(`    ⚠ Skipped (${reason})`));
-          }
-
-          // Small delay to be respectful to the API
-          await this.sleep(100);
-        }
+        const batch = await this.analyzeRepositoryBatch(repos, options);
+        repositories.push(...batch.repositories);
+        skippedRepositories.push(...batch.skippedRepositories);
         page++;
       }
     }
 
-    // Calculate summary statistics
-    const summary = this.calculateSummary(repositories, skippedRepositories);
-    const incompleteRepositories = repositories
-      .filter(repo => repo.incomplete)
-      .map(repo => ({ fullName: repo.fullName, warnings: repo.warnings }));
-
-    return {
-      repositories,
-      summary,
-      incomplete: skippedRepositories.length > 0 || incompleteRepositories.length > 0,
-      skippedRepositories,
-      incompleteRepositories
-    };
+    return this.buildAnalysisResult(repositories, skippedRepositories);
   }
 
   async analyzeOrganizationRepositories(
@@ -196,6 +184,7 @@ class GitHubArtifactsAnalyzer {
     console.log(chalk.blue(`\n📊 Analyzing organization: ${orgName}\n`));
 
     const repositories = [];
+    const skippedRepositories = [];
     let page = 1;
     let hasMore = true;
 
@@ -216,33 +205,12 @@ class GitHubArtifactsAnalyzer {
           // Filter out forks (keep only source repos)
           const filteredRepos = repos.filter(repo => !repo.fork);
 
-          // Process each repository
-          for (const repo of filteredRepos) {
-            console.log(chalk.gray(`  Checking ${repo.full_name}${repo.private ? ' (private)' : ''}...`));
-
-            try {
-              const analysis = await this.analyzeRepository(
-                repo.owner.login,
-                repo.name,
-                {
-                  includeExpired: options.includeExpired ?? false,
-                  minSize: options.minSize ?? 0
-                }
-              );
-              repositories.push(analysis);
-
-              if (analysis.totalArtifacts > 0) {
-                console.log(chalk.green(
-                  `    ✓ Found ${analysis.totalArtifacts} artifacts (${this.formatBytes(analysis.totalSizeBytes)})`
-                ));
-              }
-            } catch (error) {
-              console.log(chalk.yellow(`    ⚠ Skipped (${error?.message || 'Unknown error'})`));
-            }
-
-            // Rate limit protection
-            await this.sleep(100);
-          }
+          const batch = await this.analyzeRepositoryBatch(filteredRepos, {
+            includeExpired: options.includeExpired ?? false,
+            minSize: options.minSize ?? 0
+          });
+          repositories.push(...batch.repositories);
+          skippedRepositories.push(...batch.skippedRepositories);
           page++;
         }
       } catch (error) {
@@ -255,14 +223,7 @@ class GitHubArtifactsAnalyzer {
       }
     }
 
-    // Calculate summary
-    const summary = this.calculateSummary(repositories);
-
-    return {
-      organizationName: orgName,
-      repositories,
-      summary
-    };
+    return this.buildAnalysisResult(repositories, skippedRepositories, { organizationName: orgName });
   }
 
   async analyzeRepository(owner, repo, options = { includeExpired: false, minSize: 0 }) {
