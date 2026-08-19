@@ -7,9 +7,32 @@ import test from 'node:test';
 import { GitHubArtifactsAnalyzer } from '../dist/analyzer.js';
 import { ReportGenerator } from '../dist/reporter.js';
 
+// Stand-in for paginate.iterator(): calls the mock until it returns an empty page.
+function paginateIteratorShim(method, parameters) {
+  return {
+    [Symbol.asyncIterator]() {
+      let done = false;
+      return {
+        async next() {
+          if (done) return { done: true, value: undefined };
+          const response = await method(parameters);
+          if (!response?.data || response.data.length === 0) {
+            done = true;
+            return { done: true, value: undefined };
+          }
+          return { done: false, value: response };
+        }
+      };
+    }
+  };
+}
+
 function createAnalyzer(octokit) {
   const analyzer = new GitHubArtifactsAnalyzer('test-token');
-  analyzer.octokit = octokit;
+  analyzer.octokit = {
+    ...octokit,
+    paginate: { iterator: paginateIteratorShim }
+  };
   return analyzer;
 }
 
@@ -233,6 +256,37 @@ test('paginates through multiple pages of organization repositories', async () =
     analysis.repositories.map(r => r.fullName),
     ['my-org/repo-1', 'my-org/repo-2']
   );
+});
+
+test('paginates organization, user, and public repositories with a stable sort key', async () => {
+  // 'created' can't shift mid-scan, unlike 'updated' or a renameable full_name.
+  const seenSorts = [];
+  const analyzer = createAnalyzer({
+    repos: {
+      listForOrg: async (params) => {
+        seenSorts.push(['listForOrg', params.sort]);
+        return { data: [] };
+      },
+      listForAuthenticatedUser: async (params) => {
+        seenSorts.push(['listForAuthenticatedUser', params.sort]);
+        return { data: [] };
+      },
+      listForUser: async (params) => {
+        seenSorts.push(['listForUser', params.sort]);
+        return { data: [] };
+      },
+    },
+  });
+
+  await analyzer.analyzeOrganizationRepositories('my-org');
+  await analyzer.analyzeAllRepositories('owner');
+  await analyzer.analyzePublicRepositories('owner');
+
+  assert.deepEqual(seenSorts, [
+    ['listForOrg', 'created'],
+    ['listForAuthenticatedUser', 'created'],
+    ['listForUser', 'created'],
+  ]);
 });
 
 test('skips an organization repository that fails without aborting the scan', async () => {

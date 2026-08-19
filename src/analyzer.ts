@@ -50,9 +50,7 @@ class GitHubArtifactsAnalyzer {
     return error?.message || 'Unknown error';
   }
 
-  // Analyzes a batch of repositories, tracking per-repository failures instead
-  // of swallowing them, so every caller reports skipped/incomplete repositories
-  // explicitly rather than finishing with a silently partial summary.
+  // Analyzes repos while tracking per-repository failures instead of swallowing them.
   private async analyzeRepositoryBatch(repos, options) {
     const repositories = [];
     const skippedRepositories = [];
@@ -108,40 +106,33 @@ class GitHubArtifactsAnalyzer {
     // Get all repositories for the user - both public and private
     const repositories = [];
     const skippedRepositories = [];
-    let page = 1;
-    let hasMore = true;
 
-    while (hasMore) {
-      try {
-        // Try authenticated user's repos first (includes private repos)
-        const { data: repos } = await this.octokit.repos.listForAuthenticatedUser({
+    try {
+      // sort: 'created' is immutable, so a repo can't shift pages mid-scan.
+      for await (const { data: repos } of this.octokit.paginate.iterator(
+        this.octokit.repos.listForAuthenticatedUser,
+        {
           visibility: 'all', // Gets both public and private repos
           per_page: 100,
-          page,
-          sort: 'updated'
-        });
-
-        if (repos.length === 0) {
-          hasMore = false;
-        } else {
-          // Filter to only repos owned by the target user (not organizations)
-          const userRepos = repos.filter(repo =>
-            repo.owner.login === username && !repo.fork
-          );
-
-          const batch = await this.analyzeRepositoryBatch(userRepos, options);
-          repositories.push(...batch.repositories);
-          skippedRepositories.push(...batch.skippedRepositories);
-          page++;
+          sort: 'created'
         }
-      } catch (error) {
-        // Fallback to public repos if authenticated call fails
-        if (error.status === 401 || error.status === 403) {
-          console.log(chalk.yellow('⚠ Using public repositories only (authentication issue)'));
-          return this.analyzePublicRepositories(username, options);
-        }
-        throw error;
+      )) {
+        // Filter to only repos owned by the target user (not organizations)
+        const userRepos = repos.filter(repo =>
+          repo.owner.login === username && !repo.fork
+        );
+
+        const batch = await this.analyzeRepositoryBatch(userRepos, options);
+        repositories.push(...batch.repositories);
+        skippedRepositories.push(...batch.skippedRepositories);
       }
+    } catch (error) {
+      // Fallback to public repos if authenticated call fails
+      if (error.status === 401 || error.status === 403) {
+        console.log(chalk.yellow('⚠ Using public repositories only (authentication issue)'));
+        return this.analyzePublicRepositories(username, options);
+      }
+      throw error;
     }
 
     return this.buildAnalysisResult(repositories, skippedRepositories);
@@ -150,25 +141,19 @@ class GitHubArtifactsAnalyzer {
   async analyzePublicRepositories(username, options = { includeExpired: false, minSize: 0 }) {
     const repositories = [];
     const skippedRepositories = [];
-    let page = 1;
-    let hasMore = true;
 
-    while (hasMore) {
-      const { data: repos } = await this.octokit.repos.listForUser({
+    for await (const { data: repos } of this.octokit.paginate.iterator(
+      this.octokit.repos.listForUser,
+      {
         username,
         per_page: 100,
-        page,
-        type: 'owner' // Only repositories owned by the user, not organizations
-      });
-
-      if (repos.length === 0) {
-        hasMore = false;
-      } else {
-        const batch = await this.analyzeRepositoryBatch(repos, options);
-        repositories.push(...batch.repositories);
-        skippedRepositories.push(...batch.skippedRepositories);
-        page++;
+        type: 'owner', // Only repositories owned by the user, not organizations
+        sort: 'created'
       }
+    )) {
+      const batch = await this.analyzeRepositoryBatch(repos, options);
+      repositories.push(...batch.repositories);
+      skippedRepositories.push(...batch.skippedRepositories);
     }
 
     return this.buildAnalysisResult(repositories, skippedRepositories);
@@ -185,42 +170,35 @@ class GitHubArtifactsAnalyzer {
 
     const repositories = [];
     const skippedRepositories = [];
-    let page = 1;
-    let hasMore = true;
 
-    while (hasMore) {
-      try {
-        // Fetch organization repositories
-        const { data: repos } = await this.octokit.repos.listForOrg({
+    try {
+      // sort: 'created' is immutable, so a repo can't shift pages mid-scan.
+      for await (const { data: repos } of this.octokit.paginate.iterator(
+        this.octokit.repos.listForOrg,
+        {
           org: orgName,
           type: 'all', // all, public, private, forks, sources, member
           per_page: 100,
-          page,
-          sort: 'updated'
+          sort: 'created'
+        }
+      )) {
+        // Filter out forks (keep only source repos)
+        const filteredRepos = repos.filter(repo => !repo.fork);
+
+        const batch = await this.analyzeRepositoryBatch(filteredRepos, {
+          includeExpired: options.includeExpired ?? false,
+          minSize: options.minSize ?? 0
         });
-
-        if (repos.length === 0) {
-          hasMore = false;
-        } else {
-          // Filter out forks (keep only source repos)
-          const filteredRepos = repos.filter(repo => !repo.fork);
-
-          const batch = await this.analyzeRepositoryBatch(filteredRepos, {
-            includeExpired: options.includeExpired ?? false,
-            minSize: options.minSize ?? 0
-          });
-          repositories.push(...batch.repositories);
-          skippedRepositories.push(...batch.skippedRepositories);
-          page++;
-        }
-      } catch (error) {
-        if (error.status === 404) {
-          throw new Error(`Organization '${orgName}' not found or you don't have access`);
-        } else if (error.status === 403) {
-          throw new Error('Access forbidden - check token has read:org permission');
-        }
-        throw error;
+        repositories.push(...batch.repositories);
+        skippedRepositories.push(...batch.skippedRepositories);
       }
+    } catch (error) {
+      if (error.status === 404) {
+        throw new Error(`Organization '${orgName}' not found or you don't have access`);
+      } else if (error.status === 403) {
+        throw new Error('Access forbidden - check token has read:org permission');
+      }
+      throw error;
     }
 
     return this.buildAnalysisResult(repositories, skippedRepositories, { organizationName: orgName });
