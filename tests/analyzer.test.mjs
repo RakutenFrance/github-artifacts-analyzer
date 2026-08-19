@@ -423,3 +423,86 @@ test('CSV reports include incomplete and skipped status metadata', () => {
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+function repoWithArtifactsFixture(fullName) {
+  return {
+    fullName,
+    owner: fullName.split('/')[0],
+    name: fullName.split('/')[1],
+    totalArtifacts: 1,
+    totalSizeBytes: 500,
+    activeArtifacts: 0,
+    activeSizeBytes: 0,
+    expiredArtifacts: 1,
+    expiredSizeBytes: 500,
+    artifacts: [{ id: 1, name: 'a', sizeInBytes: 500, expired: true, createdAt: new Date() }],
+  };
+}
+
+test('cleanup requires an org-level confirmation before touching organization repositories', async () => {
+  const reporter = new ReportGenerator();
+  const questions = [];
+  reporter.askQuestion = async (rl, question) => {
+    questions.push(question);
+    return 'n';
+  };
+
+  await reporter.runCleanupMode({
+    organizationName: 'my-org',
+    repositories: [repoWithArtifactsFixture('my-org/repo1')]
+  }, {});
+
+  assert.equal(questions.length, 1);
+  assert.match(questions[0], /my-org/);
+  assert.match(questions[0], /1 repositories/);
+});
+
+test('cleanup skips all repository prompts when the org-level confirmation is declined', async () => {
+  const reporter = new ReportGenerator();
+  let repoPromptCount = 0;
+  reporter.askQuestion = async (rl, question) => {
+    if (/organization/.test(question)) return 'n';
+    repoPromptCount++;
+    return 'n';
+  };
+
+  await reporter.runCleanupMode({
+    organizationName: 'my-org',
+    repositories: [repoWithArtifactsFixture('my-org/repo1')]
+  }, {});
+
+  assert.equal(repoPromptCount, 0);
+});
+
+test('cleanup proceeds to per-repository prompts once the org-level confirmation is accepted', async () => {
+  const reporter = new ReportGenerator();
+  let repoPromptCount = 0;
+  reporter.askQuestion = async (rl, question) => {
+    if (/organization/.test(question)) return 'y';
+    repoPromptCount++;
+    return 'n';
+  };
+
+  await reporter.runCleanupMode({
+    organizationName: 'my-org',
+    repositories: [repoWithArtifactsFixture('my-org/repo1')]
+  }, { deleteArtifact: async () => true, sleep: async () => {} });
+
+  assert.equal(repoPromptCount, 1);
+});
+
+test('cleanup does not ask for an org-level confirmation outside organization analysis', async () => {
+  const reporter = new ReportGenerator();
+  const questions = [];
+  reporter.askQuestion = async (rl, question) => {
+    questions.push(question);
+    return 'n';
+  };
+
+  await reporter.runCleanupMode({
+    repositories: [repoWithArtifactsFixture('owner/repo1')]
+  }, { deleteArtifact: async () => true, sleep: async () => {} });
+
+  assert.equal(questions.length, 1);
+  assert.doesNotMatch(questions[0], /organization/);
+});

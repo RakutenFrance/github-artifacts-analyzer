@@ -367,6 +367,25 @@ class ReportGenerator {
       output: process.stdout
     });
 
+    if (analysis.organizationName) {
+      const totalArtifacts = reposWithArtifacts.reduce((sum, r) => sum + r.totalArtifacts, 0);
+      const totalSizeBytes = reposWithArtifacts.reduce((sum, r) => sum + r.totalSizeBytes, 0);
+
+      const confirmation: string = await this.askQuestion(rl,
+        chalk.bold.red(
+          `\n⚠ You are about to review cleanup for ${reposWithArtifacts.length} repositories ` +
+          `(${totalArtifacts} artifacts, ${this.formatBytes(totalSizeBytes)}) in organization '${analysis.organizationName}'.\n` +
+          `Continue? [y/N]: `
+        )
+      );
+
+      if (confirmation.toLowerCase() !== 'y' && confirmation.toLowerCase() !== 'yes') {
+        console.log(chalk.yellow('Cleanup cancelled.'));
+        rl.close();
+        return;
+      }
+    }
+
     for (const repo of reposWithArtifacts) {
       await this.runRepositoryCleanup(repo, analyzer, rl);
     }
