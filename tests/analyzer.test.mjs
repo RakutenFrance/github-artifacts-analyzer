@@ -205,6 +205,76 @@ test('warns once remaining quota drops to the configured threshold', async () =>
   assert.ok(logged.some(line => line.includes('42')));
 });
 
+function countingOrgFixture({ repoCount, workflowsPerRepo, runsPerWorkflow }) {
+  const counts = {};
+  const count = (name) => { counts[name] = (counts[name] || 0) + 1; };
+
+  const repos = Array.from({ length: repoCount }, (_, i) => ({
+    full_name: `my-org/repo-${i}`,
+    owner: { login: 'my-org' },
+    name: `repo-${i}`,
+    fork: false,
+    private: false,
+  }));
+
+  const workflows = Array.from({ length: workflowsPerRepo }, (_, i) => ({
+    id: i, name: `workflow-${i}`, path: `.github/workflows/w${i}.yml`, state: 'active',
+  }));
+
+  let repoPage = 0;
+  const octokit = {
+    repos: {
+      listForOrg: async () => {
+        count('listForOrg');
+        return { data: repoPage++ === 0 ? repos : [] };
+      },
+    },
+    actions: {
+      listRepoWorkflows: async () => {
+        count('listRepoWorkflows');
+        return { data: { total_count: workflows.length, workflows } };
+      },
+      listWorkflowRuns: async ({ workflow_id }) => {
+        count('listWorkflowRuns');
+        const runs = Array.from({ length: runsPerWorkflow }, (_, i) => ({ id: workflow_id * 1000 + i }));
+        return { data: { workflow_runs: runs } };
+      },
+      listWorkflowRunArtifacts: async ({ run_id }) => {
+        count('listWorkflowRunArtifacts');
+        return {
+          data: {
+            artifacts: [{
+              id: run_id, name: `artifact-${run_id}`, size_in_bytes: 10, expired: false,
+              created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z', expires_at: '2027-01-01T00:00:00Z',
+            }],
+          },
+        };
+      },
+    },
+  };
+
+  return { octokit, counts };
+}
+
+test('records how many API calls a full org scan makes with the current nested-loop scheme', async () => {
+  const { octokit, counts } = countingOrgFixture({ repoCount: 2, workflowsPerRepo: 3, runsPerWorkflow: 10 });
+  const analyzer = createAnalyzer(octokit);
+
+  const analysis = await analyzer.analyzeOrganizationRepositories('my-org');
+
+  assert.equal(analysis.summary.totalRepositories, 2);
+  assert.equal(analysis.summary.totalArtifacts, 60); // 2 repos * 3 workflows * 10 runs * 1 artifact
+
+  // 1 call to list workflows per repo, 1 call to list runs per workflow, 1 call
+  // to list artifacts per run - this is the O(runs) cost the review flagged.
+  assert.deepEqual(counts, {
+    listForOrg: 2,
+    listRepoWorkflows: 2,
+    listWorkflowRuns: 6,     // 2 repos * 3 workflows
+    listWorkflowRunArtifacts: 60, // 2 repos * 3 workflows * 10 runs
+  });
+});
+
 test('analyzes every non-fork repository across an organization', async () => {
   let repoPage = 0;
   const analyzer = createAnalyzer({
