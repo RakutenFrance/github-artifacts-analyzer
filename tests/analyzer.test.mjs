@@ -43,34 +43,82 @@ function workflowFixture() {
   };
 }
 
-test('marks a repository incomplete when a workflow query fails', async () => {
+test('attributes each artifact to its workflow name via the run lookup', async () => {
+  let runsPage = 0;
+  let artifactsPage = 0;
+  const analyzer = createAnalyzer({
+    actions: {
+      listRepoWorkflows: async () => ({
+        data: {
+          total_count: 2,
+          workflows: [
+            { id: 10, name: 'Build', path: '.github/workflows/build.yml', state: 'active' },
+            { id: 20, name: 'Deploy', path: '.github/workflows/deploy.yml', state: 'active' },
+          ],
+        },
+      }),
+      listWorkflowRunsForRepo: async () => ({
+        data: runsPage++ === 0
+          ? [
+            { id: 100, workflow_id: 10 },
+            { id: 200, workflow_id: 20 },
+          ]
+          : [],
+      }),
+      listArtifactsForRepo: async () => ({
+        data: artifactsPage++ === 0
+          ? [
+            {
+              id: 1, name: 'build-output', size_in_bytes: 10, expired: false,
+              created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z', expires_at: '2027-01-01T00:00:00Z',
+              workflow_run: { id: 100 },
+            },
+            {
+              id: 2, name: 'deploy-output', size_in_bytes: 20, expired: false,
+              created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z', expires_at: '2027-01-01T00:00:00Z',
+              workflow_run: { id: 200 },
+            },
+          ]
+          : [],
+      }),
+    },
+  });
+
+  const analysis = await analyzer.analyzeRepository('owner', 'repo');
+
+  assert.equal(analysis.totalArtifacts, 2);
+  assert.deepEqual(
+    analysis.artifacts.map(a => [a.name, a.workflowName]).sort(),
+    [['build-output', 'Build'], ['deploy-output', 'Deploy']]
+  );
+});
+
+test('marks a repository incomplete when the workflow run lookup fails', async () => {
   const analyzer = createAnalyzer({
     actions: {
       listRepoWorkflows: async () => ({ data: workflowFixture() }),
-      listWorkflowRuns: async () => {
+      listWorkflowRunsForRepo: async () => {
         throw Object.assign(new Error('SSO authorization required'), { status: 403 });
       },
+      listArtifactsForRepo: async () => ({ data: [] }),
     },
   });
 
   const analysis = await analyzer.analyzeRepository('owner', 'repo');
 
   assert.equal(analysis.incomplete, true);
-  assert.equal(analysis.skippedWorkflows, 1);
   assert.match(analysis.warnings[0], /SSO authorization required/);
 });
 
-test('tracks an unretried rate-limit error as a normal failure instead of aborting', async () => {
+test('tracks an unretried rate-limit error from artifact listing as a normal failure instead of aborting', async () => {
   // The @octokit/plugin-throttling transport layer retries real rate limits
   // before they ever reach application code, so anything that still throws
   // here is a genuine, non-recoverable failure and should just be tracked.
   const analyzer = createAnalyzer({
     actions: {
       listRepoWorkflows: async () => ({ data: workflowFixture() }),
-      listWorkflowRuns: async () => ({
-        data: { workflow_runs: [{ id: 20 }] },
-      }),
-      listWorkflowRunArtifacts: async () => {
+      listWorkflowRunsForRepo: async () => ({ data: [] }),
+      listArtifactsForRepo: async () => {
         throw Object.assign(new Error('API rate limit exceeded'), {
           status: 403,
           response: { headers: { 'x-ratelimit-remaining': '0' } },
@@ -82,7 +130,6 @@ test('tracks an unretried rate-limit error as a normal failure instead of aborti
   const analysis = await analyzer.analyzeRepository('owner', 'repo');
 
   assert.equal(analysis.incomplete, true);
-  assert.equal(analysis.skippedWorkflowRuns, 1);
   assert.match(analysis.warnings[0], /API rate limit exceeded/);
 });
 
@@ -124,10 +171,8 @@ test('keeps scanning the rest of an org after one repository fails without retry
     },
     actions: {
       listRepoWorkflows: async () => ({ data: workflowFixture() }),
-      listWorkflowRuns: async () => ({
-        data: { workflow_runs: [{ id: 20 }] },
-      }),
-      listWorkflowRunArtifacts: async () => {
+      listWorkflowRunsForRepo: async () => ({ data: [] }),
+      listArtifactsForRepo: async () => {
         throw Object.assign(new Error('Secondary rate limit'), {
           status: 403,
           response: { headers: { 'retry-after': '60' } },
@@ -140,7 +185,7 @@ test('keeps scanning the rest of an org after one repository fails without retry
 
   assert.equal(analysis.incomplete, true);
   assert.equal(analysis.summary.repositoriesIncomplete, 1);
-  assert.equal(analysis.repositories[0].skippedWorkflowRuns, 1);
+  assert.match(analysis.repositories[0].warnings[0], /Secondary rate limit/);
 });
 
 test('throttling plugin retries a primary rate limit and tracks the recovered quota', async () => {
@@ -221,6 +266,12 @@ function countingOrgFixture({ repoCount, workflowsPerRepo, runsPerWorkflow }) {
     id: i, name: `workflow-${i}`, path: `.github/workflows/w${i}.yml`, state: 'active',
   }));
 
+  // One artifact per run, matching the old per-run fixture, so totalArtifacts
+  // stays comparable across both the "before" and "after" call-count tests.
+  const totalRuns = workflowsPerRepo * runsPerWorkflow;
+  const runPage = new Map();
+  const artifactPage = new Map();
+
   let repoPage = 0;
   const octokit = {
     repos: {
@@ -234,20 +285,26 @@ function countingOrgFixture({ repoCount, workflowsPerRepo, runsPerWorkflow }) {
         count('listRepoWorkflows');
         return { data: { total_count: workflows.length, workflows } };
       },
-      listWorkflowRuns: async ({ workflow_id }) => {
-        count('listWorkflowRuns');
-        const runs = Array.from({ length: runsPerWorkflow }, (_, i) => ({ id: workflow_id * 1000 + i }));
-        return { data: { workflow_runs: runs } };
-      },
-      listWorkflowRunArtifacts: async ({ run_id }) => {
-        count('listWorkflowRunArtifacts');
+      listWorkflowRunsForRepo: async ({ repo }) => {
+        count('listWorkflowRunsForRepo');
+        const page = runPage.get(repo) || 0;
+        runPage.set(repo, page + 1);
+        if (page > 0) return { data: [] };
         return {
-          data: {
-            artifacts: [{
-              id: run_id, name: `artifact-${run_id}`, size_in_bytes: 10, expired: false,
-              created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z', expires_at: '2027-01-01T00:00:00Z',
-            }],
-          },
+          data: Array.from({ length: totalRuns }, (_, i) => ({ id: i, workflow_id: i % workflowsPerRepo })),
+        };
+      },
+      listArtifactsForRepo: async ({ repo }) => {
+        count('listArtifactsForRepo');
+        const page = artifactPage.get(repo) || 0;
+        artifactPage.set(repo, page + 1);
+        if (page > 0) return { data: [] };
+        return {
+          data: Array.from({ length: totalRuns }, (_, i) => ({
+            id: i, name: `artifact-${i}`, size_in_bytes: 10, expired: false,
+            created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z', expires_at: '2027-01-01T00:00:00Z',
+            workflow_run: { id: i },
+          })),
         };
       },
     },
@@ -256,7 +313,7 @@ function countingOrgFixture({ repoCount, workflowsPerRepo, runsPerWorkflow }) {
   return { octokit, counts };
 }
 
-test('records how many API calls a full org scan makes with the current nested-loop scheme', async () => {
+test('records fewer API calls per repo with the repo-level artifact/run scheme', async () => {
   const { octokit, counts } = countingOrgFixture({ repoCount: 2, workflowsPerRepo: 3, runsPerWorkflow: 10 });
   const analyzer = createAnalyzer(octokit);
 
@@ -265,13 +322,15 @@ test('records how many API calls a full org scan makes with the current nested-l
   assert.equal(analysis.summary.totalRepositories, 2);
   assert.equal(analysis.summary.totalArtifacts, 60); // 2 repos * 3 workflows * 10 runs * 1 artifact
 
-  // 1 call to list workflows per repo, 1 call to list runs per workflow, 1 call
-  // to list artifacts per run - this is the O(runs) cost the review flagged.
+  // One paginated run listing and one paginated artifact listing per repo,
+  // instead of one artifacts call per run - down from 70 calls to 12 for
+  // this fixture (was: listForOrg 2, listRepoWorkflows 2, listWorkflowRuns 6,
+  // listWorkflowRunArtifacts 60).
   assert.deepEqual(counts, {
     listForOrg: 2,
     listRepoWorkflows: 2,
-    listWorkflowRuns: 6,     // 2 repos * 3 workflows
-    listWorkflowRunArtifacts: 60, // 2 repos * 3 workflows * 10 runs
+    listWorkflowRunsForRepo: 4,   // 2 repos * (1 page of data + 1 empty page)
+    listArtifactsForRepo: 4,      // 2 repos * (1 page of data + 1 empty page)
   });
 });
 

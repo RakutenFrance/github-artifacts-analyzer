@@ -50,10 +50,64 @@ class GitHubArtifactsAnalyzer {
     return error?.message || 'Unknown error';
   }
 
-  private recordWarning(analysis, counterField, message) {
+  private recordWarning(analysis, message) {
     analysis.incomplete = true;
-    analysis[counterField]++;
     analysis.warnings.push(message);
+  }
+
+  // Paginates all workflow runs for the repo once (instead of once per workflow)
+  // to build a run_id -> workflow name lookup for artifact attribution.
+  private async buildWorkflowNameLookup(owner, repo, analysis) {
+    const workflowNameById = new Map(analysis.workflows.map(w => [w.id, w.name]));
+    const workflowNameByRunId = new Map();
+
+    try {
+      for await (const { data: runs } of this.octokit.paginate.iterator(
+        this.octokit.actions.listWorkflowRunsForRepo,
+        { owner, repo, per_page: 100 }
+      )) {
+        for (const run of runs) {
+          workflowNameByRunId.set(run.id, workflowNameById.get(run.workflow_id));
+        }
+      }
+    } catch (error) {
+      this.recordWarning(analysis, `Workflow run lookup: ${this.describeError(error)}`);
+    }
+
+    return workflowNameByRunId;
+  }
+
+  // Paginates all artifacts for the repo directly, instead of listing runs per
+  // workflow and artifacts per run - the O(runs) request cost this replaces.
+  private async collectRepositoryArtifacts(owner, repo, options, analysis, workflowNameByRunId) {
+    try {
+      for await (const { data: artifacts } of this.octokit.paginate.iterator(
+        this.octokit.actions.listArtifactsForRepo,
+        { owner, repo, per_page: 100 }
+      )) {
+        for (const artifact of artifacts) {
+          if (artifact.size_in_bytes < options.minSize) continue;
+
+          const isExpired = artifact.expired || (artifact.expires_at ? new Date(artifact.expires_at) < new Date() : false);
+          if (isExpired && !options.includeExpired) continue;
+
+          const runId = artifact.workflow_run?.id ?? null;
+          analysis.artifacts.push({
+            id: artifact.id,
+            name: artifact.name,
+            sizeInBytes: artifact.size_in_bytes,
+            createdAt: new Date(artifact.created_at || Date.now()),
+            updatedAt: new Date(artifact.updated_at || Date.now()),
+            expiresAt: new Date(artifact.expires_at || Date.now()),
+            expired: isExpired,
+            workflowRunId: runId,
+            workflowName: workflowNameByRunId.get(runId) || 'Unknown'
+          });
+        }
+      }
+    } catch (error) {
+      this.recordWarning(analysis, `Artifact listing: ${this.describeError(error)}`);
+    }
   }
 
   // Analyzes repos while tracking per-repository failures instead of swallowing them.
@@ -225,8 +279,6 @@ class GitHubArtifactsAnalyzer {
       activeSizeBytes: 0,
       expiredSizeBytes: 0,
       incomplete: false,
-      skippedWorkflowRuns: 0,
-      skippedWorkflows: 0,
       warnings: []
     };
 
@@ -249,61 +301,10 @@ class GitHubArtifactsAnalyzer {
         state: w.state
       }));
 
-      // Get artifacts for each workflow
-      for (const workflow of analysis.workflows) {
-        try {
-          // Get recent workflow runs
-          const { data: runs } = await this.octokit.actions.listWorkflowRuns({
-            owner,
-            repo,
-            workflow_id: workflow.id,
-            per_page: 100 // Limit to recent runs
-          });
-
-          for (const run of runs.workflow_runs) {
-            try {
-              // Get artifacts for this run
-              const { data: artifactsData } = await this.octokit.actions.listWorkflowRunArtifacts({
-                owner,
-                repo,
-                run_id: run.id
-              });
-
-              for (const artifact of artifactsData.artifacts) {
-                if (artifact.size_in_bytes >= options.minSize) {
-                  const isExpired = artifact.expired || (artifact.expires_at ? new Date(artifact.expires_at) < new Date() : false);
-                  
-                  if (!isExpired || options.includeExpired) {
-                    const artifactInfo = {
-                      id: artifact.id,
-                      name: artifact.name,
-                      sizeInBytes: artifact.size_in_bytes,
-                      createdAt: new Date(artifact.created_at || Date.now()),
-                      updatedAt: new Date(artifact.updated_at || Date.now()),
-                      expiresAt: new Date(artifact.expires_at || Date.now()),
-                      expired: isExpired,
-                      workflowRunId: run.id,
-                      workflowName: workflow.name
-                    };
-
-                    analysis.artifacts.push(artifactInfo);
-                  }
-                }
-              }
-            } catch (error) {
-              this.recordWarning(analysis, 'skippedWorkflowRuns',
-                `Workflow "${workflow.name}" run ${run.id}: ${this.describeError(error)}`
-              );
-              continue;
-            }
-          }
-        } catch (error) {
-          this.recordWarning(analysis, 'skippedWorkflows',
-            `Workflow "${workflow.name}": ${this.describeError(error)}`
-          );
-          continue;
-        }
-      }
+      // One pagination pass over all runs (for workflow-name attribution) and
+      // one over all artifacts, instead of one artifacts call per run.
+      const workflowNameByRunId = await this.buildWorkflowNameLookup(owner, repo, analysis);
+      await this.collectRepositoryArtifacts(owner, repo, options, analysis, workflowNameByRunId);
 
       // Calculate statistics
       analysis.totalArtifacts = analysis.artifacts.length;
