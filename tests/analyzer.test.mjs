@@ -182,6 +182,118 @@ test('warns once remaining quota drops to the configured threshold', async () =>
   assert.ok(logged.some(line => line.includes('42')));
 });
 
+test('analyzes every non-fork repository across an organization', async () => {
+  let repoPage = 0;
+  const analyzer = createAnalyzer({
+    repos: {
+      listForOrg: async () => ({
+        data: repoPage++ === 0
+          ? [
+            { full_name: 'my-org/service-a', owner: { login: 'my-org' }, name: 'service-a', fork: false, private: true },
+            { full_name: 'my-org/service-b', owner: { login: 'my-org' }, name: 'service-b', fork: false, private: false },
+            { full_name: 'my-org/vendored', owner: { login: 'my-org' }, name: 'vendored', fork: true, private: false },
+          ]
+          : [],
+      }),
+    },
+    actions: {
+      listRepoWorkflows: async () => ({ data: { total_count: 0, workflows: [] } }),
+    },
+  });
+
+  const analysis = await analyzer.analyzeOrganizationRepositories('my-org');
+
+  assert.equal(analysis.organizationName, 'my-org');
+  assert.deepEqual(
+    analysis.repositories.map(r => r.fullName),
+    ['my-org/service-a', 'my-org/service-b']
+  );
+  assert.equal(analysis.summary.totalRepositories, 2);
+});
+
+test('paginates through multiple pages of organization repositories', async () => {
+  const pages = [
+    [{ full_name: 'my-org/repo-1', owner: { login: 'my-org' }, name: 'repo-1', fork: false, private: false }],
+    [{ full_name: 'my-org/repo-2', owner: { login: 'my-org' }, name: 'repo-2', fork: false, private: false }],
+    [],
+  ];
+  let callIndex = 0;
+  const analyzer = createAnalyzer({
+    repos: {
+      listForOrg: async () => ({ data: pages[callIndex++] }),
+    },
+    actions: {
+      listRepoWorkflows: async () => ({ data: { total_count: 0, workflows: [] } }),
+    },
+  });
+
+  const analysis = await analyzer.analyzeOrganizationRepositories('my-org');
+
+  assert.deepEqual(
+    analysis.repositories.map(r => r.fullName),
+    ['my-org/repo-1', 'my-org/repo-2']
+  );
+});
+
+test('skips an organization repository that fails without aborting the scan', async () => {
+  let repoPage = 0;
+  const analyzer = createAnalyzer({
+    repos: {
+      listForOrg: async () => ({
+        data: repoPage++ === 0
+          ? [
+            { full_name: 'my-org/broken', owner: { login: 'my-org' }, name: 'broken', fork: false, private: false },
+            { full_name: 'my-org/ok', owner: { login: 'my-org' }, name: 'ok', fork: false, private: false },
+          ]
+          : [],
+      }),
+    },
+    actions: {
+      listRepoWorkflows: async ({ repo }) => {
+        if (repo === 'broken') {
+          throw Object.assign(new Error('Not found'), { status: 404 });
+        }
+        return { data: { total_count: 0, workflows: [] } };
+      },
+    },
+  });
+
+  const analysis = await analyzer.analyzeOrganizationRepositories('my-org');
+
+  assert.deepEqual(analysis.repositories.map(r => r.fullName), ['my-org/ok']);
+  assert.equal(analysis.summary.totalRepositories, 1);
+});
+
+test('reports a clear error when the organization is not found or inaccessible', async () => {
+  const analyzer = createAnalyzer({
+    repos: {
+      listForOrg: async () => {
+        throw Object.assign(new Error('Not Found'), { status: 404 });
+      },
+    },
+  });
+
+  await assert.rejects(
+    () => analyzer.analyzeOrganizationRepositories('missing-org'),
+    error => /missing-org.*not found or you don't have access/.test(error.message)
+  );
+});
+
+test('reports a clear error when the token lacks read:org access', async () => {
+  const analyzer = createAnalyzer({
+    repos: {
+      listForOrg: async () => {
+        throw Object.assign(new Error('Forbidden'), { status: 403 });
+      },
+    },
+  });
+
+  await assert.rejects(
+    () => analyzer.analyzeOrganizationRepositories('my-org'),
+    error => /read:org permission/.test(error.message)
+  );
+});
+
 test('CSV reports include incomplete and skipped status metadata', () => {
   const directory = mkdtempSync(join(tmpdir(), 'artifact-report-'));
   const outputFile = join(directory, 'report.csv');
