@@ -42,7 +42,11 @@ class ReportGenerator {
     }
 
     // Summary table
-    console.log(chalk.bold.blue('\n🚀 GitHub Artifacts Storage Analysis Summary'));
+    const title = analysis.organizationName
+      ? `🚀 GitHub Artifacts Analysis - Organization: ${analysis.organizationName}`
+      : '🚀 GitHub Artifacts Storage Analysis Summary';
+
+    console.log(chalk.bold.blue(`\n${title}`));
     console.log(chalk.gray('='.repeat(60)));
 
     const summaryTable = new Table({
