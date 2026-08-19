@@ -50,6 +50,12 @@ class GitHubArtifactsAnalyzer {
     return error?.message || 'Unknown error';
   }
 
+  private recordWarning(analysis, counterField, message) {
+    analysis.incomplete = true;
+    analysis[counterField]++;
+    analysis.warnings.push(message);
+  }
+
   // Analyzes repos while tracking per-repository failures instead of swallowing them.
   private async analyzeRepositoryBatch(repos, options) {
     const repositories = [];
@@ -285,18 +291,14 @@ class GitHubArtifactsAnalyzer {
                 }
               }
             } catch (error) {
-              analysis.incomplete = true;
-              analysis.skippedWorkflowRuns++;
-              analysis.warnings.push(
+              this.recordWarning(analysis, 'skippedWorkflowRuns',
                 `Workflow "${workflow.name}" run ${run.id}: ${this.describeError(error)}`
               );
               continue;
             }
           }
         } catch (error) {
-          analysis.incomplete = true;
-          analysis.skippedWorkflows++;
-          analysis.warnings.push(
+          this.recordWarning(analysis, 'skippedWorkflows',
             `Workflow "${workflow.name}": ${this.describeError(error)}`
           );
           continue;
