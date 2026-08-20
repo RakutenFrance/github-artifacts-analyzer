@@ -7,6 +7,7 @@ const Octokit = OctokitRest.plugin(throttling);
 class GitHubArtifactsAnalyzer {
   private octokit: InstanceType<typeof Octokit>;
   private remainingRequests: number | null = null;
+  private rateLimitResetAt: Date | null = null;
 
   constructor(token) {
     this.octokit = new Octokit({
@@ -32,18 +33,36 @@ class GitHubArtifactsAnalyzer {
     // proactively, without spending a request on a dedicated rate-limit check.
     this.octokit.hook.after('request', (response) => {
       const remaining = response.headers['x-ratelimit-remaining'];
+      const reset = response.headers['x-ratelimit-reset'];
       if (remaining !== undefined) {
         this.remainingRequests = Number(remaining);
+      }
+      if (reset !== undefined) {
+        this.rateLimitResetAt = new Date(Number(reset) * 1000);
       }
     });
   }
 
-  private warnIfQuotaLow(threshold = 100) {
-    if (this.remainingRequests !== null && this.remainingRequests <= threshold) {
-      console.log(chalk.yellow(
-        `  ⚠ Only ${this.remainingRequests} GitHub API requests remaining this hour; expect throttling waits soon.`
-      ));
+  // Rate limits are per-user, not per-token, so a token dedicated to this tool
+  // still shares quota with everything else the user does (e.g. their deploy
+  // workflows). There's nothing the user can do about a low quota mid-run, so
+  // just wait out the hourly reset instead of pressing on and starving them.
+  private async warnAndWaitIfQuotaLow(threshold = 500) {
+    if (this.remainingRequests === null || this.remainingRequests > threshold || !this.rateLimitResetAt) {
+      return;
     }
+
+    const waitMs = this.rateLimitResetAt.getTime() - Date.now();
+    if (waitMs <= 0) return;
+
+    const waitMinutes = Math.ceil(waitMs / 60000);
+    console.log(chalk.yellow(
+      `\n⏳ Rate limit low (${this.remainingRequests} requests remaining). ` +
+      `Waiting until ${this.rateLimitResetAt.toLocaleTimeString()} (${waitMinutes} minute${waitMinutes !== 1 ? 's' : ''})...`
+    ));
+    await this.sleep(waitMs + 1000);
+    console.log(chalk.green('✓ Rate limit reset. Resuming operations...\n'));
+    this.remainingRequests = null;
   }
 
   private describeError(error) {
@@ -124,7 +143,7 @@ class GitHubArtifactsAnalyzer {
     const skippedRepositories = [];
 
     for (const repo of repos) {
-      this.warnIfQuotaLow();
+      await this.warnAndWaitIfQuotaLow();
       console.log(chalk.gray(`  Checking ${repo.full_name}${repo.private ? ' (private)' : ''}...`));
       try {
         const analysis = await this.analyzeRepository(repo.owner.login, repo.name, options);

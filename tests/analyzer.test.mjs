@@ -267,13 +267,18 @@ test('throttling plugin retries a primary rate limit and tracks the recovered qu
   assert.equal(analyzer.remainingRequests, 4999);
 });
 
-test('warns once remaining quota drops to the configured threshold', async () => {
+test('pauses and waits for the hourly reset when quota drops to the configured threshold', async () => {
   const analyzer = new GitHubArtifactsAnalyzer('test-token');
   const originalFetch = globalThis.fetch;
+  const resetAt = new Date(Date.now() + 2000);
 
   globalThis.fetch = async () => new Response(JSON.stringify({ total_count: 0, workflows: [] }), {
     status: 200,
-    headers: { 'content-type': 'application/json', 'x-ratelimit-remaining': '42' },
+    headers: {
+      'content-type': 'application/json',
+      'x-ratelimit-remaining': '42',
+      'x-ratelimit-reset': String(Math.floor(resetAt.getTime() / 1000)),
+    },
   });
 
   try {
@@ -286,13 +291,18 @@ test('warns once remaining quota drops to the configured threshold', async () =>
   const originalLog = console.log;
   console.log = (...args) => logged.push(args.join(' '));
 
+  const startedAt = Date.now();
   try {
-    analyzer.warnIfQuotaLow(100);
+    await analyzer.warnAndWaitIfQuotaLow(100);
   } finally {
     console.log = originalLog;
   }
 
-  assert.ok(logged.some(line => line.includes('42')));
+  // warnAndWaitIfQuotaLow adds a 1s buffer on top of the time until reset.
+  assert.ok(Date.now() - startedAt >= 1000);
+  assert.ok(logged.some(line => line.includes('Rate limit low')));
+  assert.ok(logged.some(line => line.includes('Resuming operations')));
+  assert.equal(analyzer.remainingRequests, null);
 });
 
 function countingOrgFixture({ repoCount, workflowsPerRepo, runsPerWorkflow }) {
