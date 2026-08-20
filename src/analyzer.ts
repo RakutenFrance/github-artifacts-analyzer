@@ -95,10 +95,14 @@ class GitHubArtifactsAnalyzer {
     const workflowNameById = new Map(analysis.workflows.map(w => [w.id, w.name]));
     const workflowNameByRunId = new Map();
 
+    // No run can be older than the oldest surviving artifact, so filter
+    // server-side instead of paginating the repo's entire run history.
+    const oldestArtifactDate = new Date(Math.min(...analysis.artifacts.map(a => a.createdAt.getTime())));
+
     try {
       for await (const { data: runs } of this.octokit.paginate.iterator(
         this.octokit.actions.listWorkflowRunsForRepo,
-        { owner, repo, per_page: 100 }
+        { owner, repo, per_page: 100, created: `>=${oldestArtifactDate.toISOString()}` }
       )) {
         for (const run of runs) {
           workflowNameByRunId.set(run.id, workflowNameById.get(run.workflow_id));
