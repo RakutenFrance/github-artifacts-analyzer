@@ -1,8 +1,12 @@
 import { Octokit as OctokitRest } from '@octokit/rest';
 import { throttling } from '@octokit/plugin-throttling';
+import pLimit from 'p-limit';
 import chalk from 'chalk';
 
 const Octokit = OctokitRest.plugin(throttling);
+
+// Mirrors @octokit/plugin-throttling's own global maxConcurrent default.
+export const PROBE_CONCURRENCY = 10;
 
 class GitHubArtifactsAnalyzer {
   private octokit: InstanceType<typeof Octokit>;
@@ -67,6 +71,40 @@ class GitHubArtifactsAnalyzer {
 
   private describeError(error) {
     return error?.message || 'Unknown error';
+  }
+
+  // Cheap, non-paginated existence check: does this repo have any artifacts
+  // at all? Fails open (treats errors as "might have artifacts") so pass 3's
+  // richer error handling gets a chance to classify the failure properly.
+  private async probeRepositoryHasArtifacts(owner, repo) {
+    try {
+      const response = await this.octokit.actions.listArtifactsForRepo({ owner, repo, per_page: 1 });
+      const totalCount = response.data.total_count ?? (Array.isArray(response.data) ? response.data.length : 0);
+      return totalCount > 0;
+    } catch {
+      return true;
+    }
+  }
+
+  // Probes every repo concurrently so only repos that might have artifacts
+  // go through the expensive sequential analysis in analyzeRepositoryBatch.
+  private async filterRepositoriesWithArtifacts(repos) {
+    await this.warnAndWaitIfQuotaLow();
+
+    const limit = pLimit(PROBE_CONCURRENCY);
+    const flags = await Promise.all(
+      repos.map(repo => limit(() => this.probeRepositoryHasArtifacts(repo.owner.login, repo.name)))
+    );
+
+    const repositoriesToAnalyze = repos.filter((_, i) => flags[i]);
+    const emptyRepositoryCount = repos.length - repositoriesToAnalyze.length;
+
+    console.log(chalk.gray(
+      `  Probed ${repos.length} repositories: ${repositoriesToAnalyze.length} may have artifacts, ` +
+      `${emptyRepositoryCount} appear empty and will be skipped from detailed analysis.`
+    ));
+
+    return { repositoriesToAnalyze, emptyRepositoryCount };
   }
 
   private recordWarning(analysis, message) {
@@ -165,8 +203,8 @@ class GitHubArtifactsAnalyzer {
     return { repositories, skippedRepositories };
   }
 
-  private buildAnalysisResult(repositories, skippedRepositories, extra = {}) {
-    const summary = this.calculateSummary(repositories, skippedRepositories);
+  private buildAnalysisResult(repositories, skippedRepositories, extra = {}, emptyRepositoryCount = 0) {
+    const summary = this.calculateSummary(repositories, skippedRepositories, emptyRepositoryCount);
     const incompleteRepositories = repositories
       .filter(repo => repo.incomplete)
       .map(repo => ({ fullName: repo.fullName, warnings: repo.warnings }));
@@ -181,6 +219,65 @@ class GitHubArtifactsAnalyzer {
     };
   }
 
+  // Pass 1: list every repo owned by the user, with no per-repo API calls yet.
+  private async listAllRepositoriesForUser(username) {
+    const repos = [];
+
+    // sort: 'created' is immutable, so a repo can't shift pages mid-scan.
+    for await (const { data: page } of this.octokit.paginate.iterator(
+      this.octokit.repos.listForAuthenticatedUser,
+      {
+        visibility: 'all', // Gets both public and private repos
+        per_page: 100,
+        sort: 'created'
+      }
+    )) {
+      // Filter to only repos owned by the target user (not organizations)
+      repos.push(...page.filter(repo => repo.owner.login === username && !repo.fork));
+    }
+
+    return repos;
+  }
+
+  // Pass 1: list every public repo owned by the user, with no per-repo API calls yet.
+  private async listPublicRepositoriesForUser(username) {
+    const repos = [];
+
+    for await (const { data: page } of this.octokit.paginate.iterator(
+      this.octokit.repos.listForUser,
+      {
+        username,
+        per_page: 100,
+        type: 'owner', // Only repositories owned by the user, not organizations
+        sort: 'created'
+      }
+    )) {
+      repos.push(...page);
+    }
+
+    return repos;
+  }
+
+  // Pass 1: list every non-fork repo in the org, with no per-repo API calls yet.
+  private async listOrganizationRepositories(orgName) {
+    const repos = [];
+
+    // sort: 'created' is immutable, so a repo can't shift pages mid-scan.
+    for await (const { data: page } of this.octokit.paginate.iterator(
+      this.octokit.repos.listForOrg,
+      {
+        org: orgName,
+        type: 'all', // all, public, private, forks, sources, member
+        per_page: 100,
+        sort: 'created'
+      }
+    )) {
+      repos.push(...page.filter(repo => !repo.fork));
+    }
+
+    return repos;
+  }
+
   async analyzeAllRepositories(username, options = { includeExpired: false, minSize: 0 }) {
     // Get authenticated user if no username provided
     if (!username) {
@@ -190,29 +287,9 @@ class GitHubArtifactsAnalyzer {
 
     console.log(chalk.blue(`\n📊 Analyzing repositories for user: ${username}\n`));
 
-    // Get all repositories for the user - both public and private
-    const repositories = [];
-    const skippedRepositories = [];
-
+    let repos;
     try {
-      // sort: 'created' is immutable, so a repo can't shift pages mid-scan.
-      for await (const { data: repos } of this.octokit.paginate.iterator(
-        this.octokit.repos.listForAuthenticatedUser,
-        {
-          visibility: 'all', // Gets both public and private repos
-          per_page: 100,
-          sort: 'created'
-        }
-      )) {
-        // Filter to only repos owned by the target user (not organizations)
-        const userRepos = repos.filter(repo =>
-          repo.owner.login === username && !repo.fork
-        );
-
-        const batch = await this.analyzeRepositoryBatch(userRepos, options);
-        repositories.push(...batch.repositories);
-        skippedRepositories.push(...batch.skippedRepositories);
-      }
+      repos = await this.listAllRepositoriesForUser(username);
     } catch (error) {
       // Fallback to public repos if authenticated call fails
       if (error.status === 401 || error.status === 403) {
@@ -222,28 +299,18 @@ class GitHubArtifactsAnalyzer {
       throw error;
     }
 
-    return this.buildAnalysisResult(repositories, skippedRepositories);
+    const { repositoriesToAnalyze, emptyRepositoryCount } = await this.filterRepositoriesWithArtifacts(repos);
+    const { repositories, skippedRepositories } = await this.analyzeRepositoryBatch(repositoriesToAnalyze, options);
+
+    return this.buildAnalysisResult(repositories, skippedRepositories, {}, emptyRepositoryCount);
   }
 
   async analyzePublicRepositories(username, options = { includeExpired: false, minSize: 0 }) {
-    const repositories = [];
-    const skippedRepositories = [];
+    const repos = await this.listPublicRepositoriesForUser(username);
+    const { repositoriesToAnalyze, emptyRepositoryCount } = await this.filterRepositoriesWithArtifacts(repos);
+    const { repositories, skippedRepositories } = await this.analyzeRepositoryBatch(repositoriesToAnalyze, options);
 
-    for await (const { data: repos } of this.octokit.paginate.iterator(
-      this.octokit.repos.listForUser,
-      {
-        username,
-        per_page: 100,
-        type: 'owner', // Only repositories owned by the user, not organizations
-        sort: 'created'
-      }
-    )) {
-      const batch = await this.analyzeRepositoryBatch(repos, options);
-      repositories.push(...batch.repositories);
-      skippedRepositories.push(...batch.skippedRepositories);
-    }
-
-    return this.buildAnalysisResult(repositories, skippedRepositories);
+    return this.buildAnalysisResult(repositories, skippedRepositories, {}, emptyRepositoryCount);
   }
 
   async analyzeOrganizationRepositories(
@@ -255,30 +322,9 @@ class GitHubArtifactsAnalyzer {
   ) {
     console.log(chalk.blue(`\n📊 Analyzing organization: ${orgName}\n`));
 
-    const repositories = [];
-    const skippedRepositories = [];
-
+    let repos;
     try {
-      // sort: 'created' is immutable, so a repo can't shift pages mid-scan.
-      for await (const { data: repos } of this.octokit.paginate.iterator(
-        this.octokit.repos.listForOrg,
-        {
-          org: orgName,
-          type: 'all', // all, public, private, forks, sources, member
-          per_page: 100,
-          sort: 'created'
-        }
-      )) {
-        // Filter out forks (keep only source repos)
-        const filteredRepos = repos.filter(repo => !repo.fork);
-
-        const batch = await this.analyzeRepositoryBatch(filteredRepos, {
-          includeExpired: options.includeExpired ?? false,
-          minSize: options.minSize ?? 0
-        });
-        repositories.push(...batch.repositories);
-        skippedRepositories.push(...batch.skippedRepositories);
-      }
+      repos = await this.listOrganizationRepositories(orgName);
     } catch (error) {
       if (error.status === 404) {
         throw new Error(`Organization '${orgName}' not found or you don't have access`);
@@ -288,7 +334,13 @@ class GitHubArtifactsAnalyzer {
       throw error;
     }
 
-    return this.buildAnalysisResult(repositories, skippedRepositories, { organizationName: orgName });
+    const { repositoriesToAnalyze, emptyRepositoryCount } = await this.filterRepositoriesWithArtifacts(repos);
+    const { repositories, skippedRepositories } = await this.analyzeRepositoryBatch(repositoriesToAnalyze, {
+      includeExpired: options.includeExpired ?? false,
+      minSize: options.minSize ?? 0
+    });
+
+    return this.buildAnalysisResult(repositories, skippedRepositories, { organizationName: orgName }, emptyRepositoryCount);
   }
 
   async analyzeRepository(owner, repo, options = { includeExpired: false, minSize: 0 }) {
@@ -356,10 +408,11 @@ class GitHubArtifactsAnalyzer {
     return analysis;
   }
 
-  calculateSummary(repositories, skippedRepositories = []) {
+  calculateSummary(repositories, skippedRepositories = [], emptyRepositoryCount = 0) {
     return {
-      totalRepositories: repositories.length,
+      totalRepositories: repositories.length + skippedRepositories.length + emptyRepositoryCount,
       repositoriesSkipped: skippedRepositories.length,
+      repositoriesWithoutArtifacts: emptyRepositoryCount,
       repositoriesIncomplete: repositories.filter(r => r.incomplete).length,
       repositoriesWithWorkflows: repositories.filter(r => r.hasWorkflows).length,
       repositoriesWithArtifacts: repositories.filter(r => r.totalArtifacts > 0).length,

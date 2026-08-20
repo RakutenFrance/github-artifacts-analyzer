@@ -4,8 +4,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import { GitHubArtifactsAnalyzer } from '../dist/analyzer.js';
+import { GitHubArtifactsAnalyzer, PROBE_CONCURRENCY } from '../dist/analyzer.js';
 import { ReportGenerator } from '../dist/reporter.js';
+
+// listArtifactsForRepo is called two different ways: directly, as the pass-2
+// artifact-existence probe (per_page: 1, expects { data: { total_count } }),
+// and via paginate.iterator, for pass-3's full collection (per_page: 100,
+// expects flattened { data: [...] } pages terminating on an empty array).
+// Fixtures mocking this method for org/user-level tests must branch on
+// params.per_page to return the right shape for whichever call is being served.
 
 // Stand-in for paginate.iterator(): calls the mock until it returns an empty page.
 function paginateIteratorShim(method, parameters) {
@@ -192,6 +199,7 @@ test('tracks repositories that could not be analyzed', async () => {
       listRepoWorkflows: async () => {
         throw Object.assign(new Error('Not found'), { status: 404 });
       },
+      listArtifactsForRepo: async () => ({ data: { total_count: 1 } }),
     },
   });
 
@@ -217,7 +225,8 @@ test('keeps scanning the rest of an org after one repository fails without retry
     actions: {
       listRepoWorkflows: async () => ({ data: workflowFixture() }),
       listWorkflowRunsForRepo: async () => ({ data: [] }),
-      listArtifactsForRepo: async () => {
+      listArtifactsForRepo: async ({ per_page }) => {
+        if (per_page === 1) return { data: { total_count: 1 } };
         throw Object.assign(new Error('Secondary rate limit'), {
           status: 403,
           response: { headers: { 'retry-after': '60' } },
@@ -349,8 +358,9 @@ function countingOrgFixture({ repoCount, workflowsPerRepo, runsPerWorkflow }) {
           data: Array.from({ length: totalRuns }, (_, i) => ({ id: i, workflow_id: i % workflowsPerRepo })),
         };
       },
-      listArtifactsForRepo: async ({ repo }) => {
+      listArtifactsForRepo: async ({ repo, per_page }) => {
         count('listArtifactsForRepo');
+        if (per_page === 1) return { data: { total_count: totalRuns } };
         const page = artifactPage.get(repo) || 0;
         artifactPage.set(repo, page + 1);
         if (page > 0) return { data: [] };
@@ -368,6 +378,93 @@ function countingOrgFixture({ repoCount, workflowsPerRepo, runsPerWorkflow }) {
   return { octokit, counts };
 }
 
+test('excludes a repository from detailed analysis when the artifact probe finds nothing', async () => {
+  let repoPage = 0;
+  const analyzer = createAnalyzer({
+    repos: {
+      listForOrg: async () => ({
+        data: repoPage++ === 0
+          ? [{ full_name: 'my-org/empty', owner: { login: 'my-org' }, name: 'empty', fork: false, private: false }]
+          : [],
+      }),
+    },
+    actions: {
+      listArtifactsForRepo: async (params) => {
+        assert.equal(params.per_page, 1); // only ever called as a probe in this test
+        return { data: { total_count: 0 } };
+      },
+      listRepoWorkflows: async () => {
+        throw new Error('should never be called for a repo the probe found empty');
+      },
+    },
+  });
+
+  const analysis = await analyzer.analyzeOrganizationRepositories('my-org');
+
+  assert.equal(analysis.repositories.length, 0);
+  assert.equal(analysis.summary.repositoriesWithoutArtifacts, 1);
+  assert.equal(analysis.summary.totalRepositories, 1); // 0 analyzed + 0 skipped + 1 empty
+});
+
+test('bounds concurrent artifact probes to the configured limit', async () => {
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const repos = Array.from({ length: 20 }, (_, i) => ({
+    full_name: `my-org/repo-${i}`, owner: { login: 'my-org' }, name: `repo-${i}`, fork: false, private: false,
+  }));
+  let repoPage = 0;
+
+  const analyzer = createAnalyzer({
+    repos: {
+      listForOrg: async () => ({ data: repoPage++ === 0 ? repos : [] }),
+    },
+    actions: {
+      listArtifactsForRepo: async () => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise(resolve => setTimeout(resolve, 10));
+        inFlight--;
+        return { data: { total_count: 0 } };
+      },
+    },
+  });
+
+  await analyzer.analyzeOrganizationRepositories('my-org');
+
+  assert.ok(maxInFlight <= PROBE_CONCURRENCY);
+  assert.ok(maxInFlight > 1); // proves the probes actually ran concurrently, not serially
+});
+
+test('proceeds to full analysis when the artifact probe itself fails, and tracks any subsequent pass-3 failure normally', async () => {
+  let repoPage = 0;
+  const analyzer = createAnalyzer({
+    repos: {
+      listForOrg: async () => ({
+        data: repoPage++ === 0
+          ? [{ full_name: 'my-org/repo', owner: { login: 'my-org' }, name: 'repo', fork: false, private: false }]
+          : [],
+      }),
+    },
+    actions: {
+      listArtifactsForRepo: async ({ per_page }) => {
+        if (per_page === 1) throw new Error('probe network blip');
+        return { data: [] };
+      },
+      listRepoWorkflows: async () => {
+        throw Object.assign(new Error('Not found'), { status: 404 });
+      },
+    },
+  });
+
+  const analysis = await analyzer.analyzeOrganizationRepositories('my-org');
+
+  assert.deepEqual(analysis.skippedRepositories, [
+    { fullName: 'my-org/repo', reason: 'Repository not found or no access' },
+  ]);
+  // Failed open, then failed for real in pass 3 - not counted as "empty".
+  assert.equal(analysis.summary.repositoriesWithoutArtifacts, 0);
+});
+
 test('records fewer API calls per repo with the repo-level artifact/run scheme', async () => {
   const { octokit, counts } = countingOrgFixture({ repoCount: 2, workflowsPerRepo: 3, runsPerWorkflow: 10 });
   const analyzer = createAnalyzer(octokit);
@@ -378,14 +475,15 @@ test('records fewer API calls per repo with the repo-level artifact/run scheme',
   assert.equal(analysis.summary.totalArtifacts, 60); // 2 repos * 3 workflows * 10 runs * 1 artifact
 
   // One paginated run listing and one paginated artifact listing per repo,
-  // instead of one artifacts call per run - down from 70 calls to 12 for
+  // instead of one artifacts call per run - down from 70 calls to 14 for
   // this fixture (was: listForOrg 2, listRepoWorkflows 2, listWorkflowRuns 6,
-  // listWorkflowRunArtifacts 60).
+  // listWorkflowRunArtifacts 60). The extra 2 calls beyond the prior 12-call
+  // baseline are the pass-2 artifact-existence probes (1 per repo).
   assert.deepEqual(counts, {
     listForOrg: 2,
     listRepoWorkflows: 2,
     listWorkflowRunsForRepo: 4,   // 2 repos * (1 page of data + 1 empty page)
-    listArtifactsForRepo: 4,      // 2 repos * (1 page of data + 1 empty page)
+    listArtifactsForRepo: 6,      // 2 repos * (1 probe + 1 page of data + 1 empty page)
   });
 });
 
@@ -437,6 +535,9 @@ test('analyzes every non-fork repository across an organization', async () => {
     },
     actions: {
       listRepoWorkflows: async () => ({ data: { total_count: 0, workflows: [] } }),
+      // Probe reports artifacts might exist, so both repos still reach pass 3
+      // (where listRepoWorkflows' zero-workflow early-exit takes over).
+      listArtifactsForRepo: async () => ({ data: { total_count: 1 } }),
     },
   });
 
@@ -463,6 +564,7 @@ test('paginates through multiple pages of organization repositories', async () =
     },
     actions: {
       listRepoWorkflows: async () => ({ data: { total_count: 0, workflows: [] } }),
+      listArtifactsForRepo: async () => ({ data: { total_count: 1 } }),
     },
   });
 
@@ -525,13 +627,15 @@ test('skips an organization repository that fails without aborting the scan', as
         }
         return { data: { total_count: 0, workflows: [] } };
       },
+      listArtifactsForRepo: async () => ({ data: { total_count: 1 } }),
     },
   });
 
   const analysis = await analyzer.analyzeOrganizationRepositories('my-org');
 
   assert.deepEqual(analysis.repositories.map(r => r.fullName), ['my-org/ok']);
-  assert.equal(analysis.summary.totalRepositories, 1);
+  // 1 successfully analyzed + 1 that failed at pass 3 = 2 of the 2 repos pass 1 found.
+  assert.equal(analysis.summary.totalRepositories, 2);
   assert.equal(analysis.incomplete, true);
   assert.equal(analysis.summary.repositoriesSkipped, 1);
   assert.deepEqual(analysis.skippedRepositories, [
@@ -566,13 +670,15 @@ test('tracks every organization repository failure instead of reporting a falsel
         }
         return { data: { total_count: 0, workflows: [] } };
       },
+      listArtifactsForRepo: async () => ({ data: { total_count: 1 } }),
     },
   });
 
   const analysis = await analyzer.analyzeOrganizationRepositories('my-org');
 
   assert.equal(analysis.incomplete, true);
-  assert.equal(analysis.summary.totalRepositories, 1);
+  // 1 successfully analyzed + 2 that failed at pass 3 = all 3 repos pass 1 found.
+  assert.equal(analysis.summary.totalRepositories, 3);
   assert.equal(analysis.summary.repositoriesSkipped, 2);
   assert.deepEqual(
     analysis.skippedRepositories.map(r => r.fullName).sort(),
