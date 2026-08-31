@@ -4,10 +4,10 @@ import { writeFileSync } from 'fs';
 import * as readline from 'readline';
 
 class ReportGenerator {
-  async generateReport(analysis, options) {
+  async generateReport(analysis, options, packagesAnalysis = null) {
     switch (options.format) {
       case 'json':
-        this.generateJsonReport(analysis, options.outputFile);
+        this.generateJsonReport(analysis, options.outputFile, packagesAnalysis);
         break;
       case 'csv':
         this.generateCsvReport(analysis, options.outputFile);
@@ -15,6 +15,9 @@ class ReportGenerator {
       case 'table':
       default:
         this.generateTableReport(analysis, options.topCount || 10);
+        if (packagesAnalysis) {
+          this.generatePackagesTableReport(packagesAnalysis);
+        }
         break;
     }
   }
@@ -117,6 +120,92 @@ class ReportGenerator {
     }
   }
 
+  generatePackagesTableReport(packagesAnalysis) {
+    if (packagesAnalysis.incomplete) {
+      console.log(chalk.bold.red(
+        '\n⚠ Incomplete packages analysis: some GitHub API requests failed. Totals below are partial.'
+      ));
+      for (const warning of packagesAnalysis.warnings) {
+        console.log(chalk.yellow(`  ⚠ ${warning}`));
+      }
+    }
+
+    console.log(chalk.bold.blue('\n📦 GitHub Packages Storage'));
+    console.log(chalk.gray('='.repeat(60)));
+
+    const { summary } = packagesAnalysis;
+
+    const summaryTable = new Table({
+      head: ['Metric', 'Value'],
+      style: { head: ['cyan'] }
+    });
+
+    summaryTable.push(
+      ['Total Packages', summary.totalPackages.toLocaleString()],
+      ['Total Versions', summary.totalVersions.toLocaleString()],
+      ['Total Known Storage Used', this.formatBytes(summary.totalSizeBytes)],
+      ['Packages with Unknown Size', summary.packagesWithUnknownSize.toLocaleString()]
+    );
+
+    console.log(summaryTable.toString());
+
+    console.log(chalk.bold.blue('\n📊 Packages by Type'));
+    console.log(chalk.gray('='.repeat(60)));
+
+    const byTypeTable = new Table({
+      head: ['Type', 'Packages', 'Versions', 'Storage Used'],
+      style: { head: ['cyan'] }
+    });
+
+    for (const [packageType, stats] of Object.entries<any>(summary.byPackageType)) {
+      if (stats.packageCount === 0) continue;
+      byTypeTable.push([
+        packageType,
+        stats.packageCount.toLocaleString(),
+        stats.versionCount.toLocaleString(),
+        stats.sizeKnown ? this.formatBytes(stats.sizeBytes) : chalk.gray('unknown')
+      ]);
+    }
+
+    console.log(byTypeTable.toString());
+
+    if (summary.packagesWithUnknownSize > 0) {
+      console.log(chalk.gray(
+        '\nNote: GitHub does not expose byte sizes for npm, Docker/container, NuGet, ' +
+        'or RubyGems packages via any documented API - only Maven package sizes ' +
+        'above are real byte counts. Version counts are still accurate for all types.'
+      ));
+    }
+
+    const topByVersions = packagesAnalysis.packages
+      .slice()
+      .sort((a, b) => b.versions.length - a.versions.length)
+      .slice(0, 10)
+      .filter(pkg => pkg.versions.length > 0);
+
+    if (topByVersions.length > 0) {
+      console.log(chalk.bold.blue('\n📊 Top Packages by Version Count'));
+      console.log(chalk.gray('='.repeat(60)));
+
+      const topTable = new Table({
+        head: ['Package', 'Type', 'Repository', 'Versions', 'Size'],
+        style: { head: ['cyan'] }
+      });
+
+      for (const pkg of topByVersions) {
+        topTable.push([
+          pkg.name,
+          pkg.packageType,
+          pkg.repositoryFullName || chalk.gray('unknown'),
+          pkg.versions.length.toLocaleString(),
+          pkg.sizeBytes === null ? chalk.gray('unknown') : this.formatBytes(pkg.sizeBytes)
+        ]);
+      }
+
+      console.log(topTable.toString());
+    }
+  }
+
   generateRepositoryTableReport(analysis) {
     console.log(chalk.bold.blue(`\n📊 Repository Analysis: ${analysis.fullName}`));
     console.log(chalk.gray('='.repeat(60)));
@@ -191,9 +280,13 @@ class ReportGenerator {
     console.log(artifactTable.toString());
   }
 
-  generateJsonReport(analysis, outputFile) {
-    const jsonOutput = JSON.stringify(analysis, null, 2);
-    
+  generateJsonReport(analysis, outputFile, packagesAnalysis = null) {
+    const jsonOutput = JSON.stringify(
+      packagesAnalysis ? { ...analysis, packages: packagesAnalysis } : analysis,
+      null,
+      2
+    );
+
     if (outputFile) {
       writeFileSync(outputFile, jsonOutput);
       console.log(chalk.green(`✅ JSON report saved to: ${outputFile}`));

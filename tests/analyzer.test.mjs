@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import { GitHubArtifactsAnalyzer, PROBE_CONCURRENCY } from '../dist/analyzer.js';
+import { GitHubArtifactsAnalyzer, PROBE_CONCURRENCY } from '../dist/artifact-analyzer.js';
 import { ReportGenerator } from '../dist/reporter.js';
 
 // listArtifactsForRepo is called two different ways: directly, as the pass-2

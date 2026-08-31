@@ -2,7 +2,8 @@
 
 import * as dotenv from 'dotenv';
 import { Command, InvalidArgumentError } from 'commander';
-import { GitHubArtifactsAnalyzer } from './analyzer.js';
+import { GitHubArtifactsAnalyzer } from './artifact-analyzer.js';
+import { GitHubPackagesAnalyzer } from './packages-analyzer.js';
 import { ReportGenerator } from './reporter.js';
 import chalk from 'chalk';
 import ora from 'ora';
@@ -145,9 +146,9 @@ program
     const spinner = ora(`Analyzing organization: ${org}...`).start();
 
     try {
-      const analyzer = new GitHubArtifactsAnalyzer(token, {
-        onProgress: (message) => { spinner.text = message; }
-      });
+      const onProgress = (message) => { spinner.text = message; };
+      const analyzer = new GitHubArtifactsAnalyzer(token, { onProgress });
+      const packagesAnalyzer = new GitHubPackagesAnalyzer(token, { onProgress });
       const reporter = new ReportGenerator();
 
       spinner.text = 'Fetching organization repositories...';
@@ -156,16 +157,18 @@ program
         minSize: options.minSize,
       });
 
-      spinner.succeed('Analysis complete!');
-
       if (options.cleanup) {
+        spinner.succeed('Analysis complete!');
         await reporter.runCleanupMode(analysis, analyzer);
       } else {
+        const packagesAnalysis = await packagesAnalyzer.analyzePackages(org, { isOrg: true });
+
+        spinner.succeed('Analysis complete!');
         await reporter.generateReport(analysis, {
           format: options.format,
           outputFile: options.output,
           topCount: options.top,
-        });
+        }, packagesAnalysis);
       }
 
     } catch (error) {

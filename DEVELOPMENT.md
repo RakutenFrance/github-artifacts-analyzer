@@ -109,13 +109,17 @@ rm -rf dist && npm run build
 ### Project Structure
 ```
 src/           # TypeScript source files (.ts)
-├── analyzer.ts    # Main analysis logic
-├── index.ts       # CLI entry point  
-├── reporter.ts    # Output formatting
+├── github-client.ts      # Shared Octokit setup, rate-limit handling, progress reporting
+├── artifact-analyzer.ts  # Repository/artifact analysis logic
+├── packages-analyzer.ts  # GitHub Packages storage analysis logic
+├── index.ts              # CLI entry point
+├── reporter.ts            # Output formatting
 
 dist/          # Compiled JavaScript (.js + .d.ts)
-├── analyzer.js    # Compiled from analyzer.ts
-├── index.js       # Compiled from index.ts
-├── reporter.js    # Compiled from reporter.ts
+├── github-client.js
+├── artifact-analyzer.js
+├── packages-analyzer.js
+├── index.js
+├── reporter.js
 └── *.d.ts         # TypeScript type definitions
 ```
