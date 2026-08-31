@@ -34,8 +34,8 @@ function paginateIteratorShim(method, parameters) {
   };
 }
 
-function createAnalyzer(octokit) {
-  const analyzer = new GitHubArtifactsAnalyzer('test-token');
+function createAnalyzer(octokit, options = {}) {
+  const analyzer = new GitHubArtifactsAnalyzer('test-token', options);
   analyzer.octokit = {
     ...octokit,
     paginate: { iterator: paginateIteratorShim }
@@ -377,6 +377,31 @@ function countingOrgFixture({ repoCount, workflowsPerRepo, runsPerWorkflow }) {
 
   return { octokit, counts };
 }
+
+test('reports progress through listing, probing, and analyzing a repository', async () => {
+  let repoPage = 0;
+  const progressMessages = [];
+  const analyzer = createAnalyzer({
+    repos: {
+      listForOrg: async () => ({
+        data: repoPage++ === 0
+          ? [{ full_name: 'my-org/repo', owner: { login: 'my-org' }, name: 'repo', fork: false, private: false }]
+          : [],
+      }),
+    },
+    actions: {
+      listArtifactsForRepo: async ({ per_page }) =>
+        per_page === 1 ? { data: { total_count: 1 } } : { data: [] },
+      listRepoWorkflows: async () => ({ data: { total_count: 0, workflows: [] } }),
+    },
+  }, { onProgress: (message) => progressMessages.push(message) });
+
+  await analyzer.analyzeOrganizationRepositories('my-org');
+
+  assert.ok(progressMessages.some(m => /Fetching organization repositories.*1 found/.test(m)));
+  assert.ok(progressMessages.some(m => /Probing repositories for artifacts.*1\/1/.test(m)));
+  assert.ok(progressMessages.some(m => m === 'Looking for artifacts in repository my-org/repo...'));
+});
 
 test('excludes a repository from detailed analysis when the artifact probe finds nothing', async () => {
   let repoPage = 0;

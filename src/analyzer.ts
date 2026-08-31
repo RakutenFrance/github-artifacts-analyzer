@@ -12,8 +12,10 @@ class GitHubArtifactsAnalyzer {
   private octokit: InstanceType<typeof Octokit>;
   private remainingRequests: number | null = null;
   private rateLimitResetAt: Date | null = null;
+  private onProgress: (message: string) => void;
 
-  constructor(token) {
+  constructor(token, { onProgress = (_message: string) => {} } = {}) {
+    this.onProgress = onProgress;
     this.octokit = new Octokit({
       auth: token,
       userAgent: 'github-artifacts-analyzer/1.0.0',
@@ -91,9 +93,15 @@ class GitHubArtifactsAnalyzer {
   private async filterRepositoriesWithArtifacts(repos) {
     await this.warnAndWaitIfQuotaLow();
 
+    let probedCount = 0;
     const limit = pLimit(PROBE_CONCURRENCY);
     const flags = await Promise.all(
-      repos.map(repo => limit(() => this.probeRepositoryHasArtifacts(repo.owner.login, repo.name)))
+      repos.map(repo => limit(async () => {
+        const hasArtifacts = await this.probeRepositoryHasArtifacts(repo.owner.login, repo.name);
+        probedCount++;
+        this.onProgress(`Probing repositories for artifacts... (${probedCount}/${repos.length})`);
+        return hasArtifacts;
+      }))
     );
 
     const repositoriesToAnalyze = repos.filter((_, i) => flags[i]);
@@ -182,7 +190,7 @@ class GitHubArtifactsAnalyzer {
 
     for (const repo of repos) {
       await this.warnAndWaitIfQuotaLow();
-      console.log(chalk.gray(`  Checking ${repo.full_name}${repo.private ? ' (private)' : ''}...`));
+      this.onProgress(`Looking for artifacts in repository ${repo.full_name}...`);
       try {
         const analysis = await this.analyzeRepository(repo.owner.login, repo.name, options);
         repositories.push(analysis);
@@ -234,6 +242,7 @@ class GitHubArtifactsAnalyzer {
     )) {
       // Filter to only repos owned by the target user (not organizations)
       repos.push(...page.filter(repo => repo.owner.login === username && !repo.fork));
+      this.onProgress(`Fetching repositories... (${repos.length} found)`);
     }
 
     return repos;
@@ -253,6 +262,7 @@ class GitHubArtifactsAnalyzer {
       }
     )) {
       repos.push(...page);
+      this.onProgress(`Fetching repositories... (${repos.length} found)`);
     }
 
     return repos;
@@ -273,6 +283,7 @@ class GitHubArtifactsAnalyzer {
       }
     )) {
       repos.push(...page.filter(repo => !repo.fork));
+      this.onProgress(`Fetching organization repositories... (${repos.length} found)`);
     }
 
     return repos;

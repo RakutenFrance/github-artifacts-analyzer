@@ -46,7 +46,9 @@ program
     const spinner = ora('Initializing GitHub API...').start();
 
     try {
-      const analyzer = new GitHubArtifactsAnalyzer(token);
+      const analyzer = new GitHubArtifactsAnalyzer(token, {
+        onProgress: (message) => { spinner.text = message; }
+      });
       const reporter = new ReportGenerator();
 
       spinner.text = 'Fetching repositories...';
@@ -143,7 +145,9 @@ program
     const spinner = ora(`Analyzing organization: ${org}...`).start();
 
     try {
-      const analyzer = new GitHubArtifactsAnalyzer(token);
+      const analyzer = new GitHubArtifactsAnalyzer(token, {
+        onProgress: (message) => { spinner.text = message; }
+      });
       const reporter = new ReportGenerator();
 
       spinner.text = 'Fetching organization repositories...';
