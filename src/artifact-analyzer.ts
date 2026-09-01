@@ -240,8 +240,6 @@ class GitHubArtifactsAnalyzer extends GitHubClient {
       username = user.login;
     }
 
-    console.log(chalk.blue(`\n📊 Analyzing repositories for user: ${username}\n`));
-
     let repos;
     try {
       repos = await this.listAllRepositoriesForUser(username);
@@ -275,8 +273,6 @@ class GitHubArtifactsAnalyzer extends GitHubClient {
       minSize: 0
     }
   ) {
-    console.log(chalk.blue(`\n📊 Analyzing organization: ${orgName}\n`));
-
     let repos;
     try {
       repos = await this.listOrganizationRepositories(orgName);
