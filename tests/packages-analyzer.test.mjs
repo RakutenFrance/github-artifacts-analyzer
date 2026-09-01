@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { GitHubPackagesAnalyzer, PACKAGE_TYPES } from '../dist/packages-analyzer.js';
+import { GitHubPackagesAnalyzer, PACKAGE_TYPES, VERSION_COLLECTION_CONCURRENCY } from '../dist/packages-analyzer.js';
 
 // listPackagesForOrganization/listPackagesForUser require a package_type
 // filter and don't accept "all" - the analyzer loops over every known
@@ -244,4 +244,31 @@ test('surfaces container version tags for later cleanup-marker detection', async
   const result = await analyzer.analyzePackages('my-org', { isOrg: true });
 
   assert.deepEqual(result.packages[0].versions[0].tags, ['0.0.1-SNAPSHOT']);
+});
+
+test('bounds concurrent package version collection to the configured limit', async () => {
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const packages = Array.from({ length: 20 }, (_, i) => ({
+    name: `pkg-${i}`, visibility: 'private',
+    created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-02T00:00:00Z',
+  }));
+
+  const analyzer = createPackagesAnalyzer({
+    packages: {
+      listPackagesForOrganization: packagesFixture('npm', packages),
+      getAllPackageVersionsForPackageOwnedByOrg: async () => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise(resolve => setTimeout(resolve, 10));
+        inFlight--;
+        return { data: [] };
+      },
+    },
+  });
+
+  await analyzer.analyzePackages('my-org', { isOrg: true });
+
+  assert.ok(maxInFlight <= VERSION_COLLECTION_CONCURRENCY);
+  assert.ok(maxInFlight > 1); // proves version collection actually ran concurrently, not serially
 });

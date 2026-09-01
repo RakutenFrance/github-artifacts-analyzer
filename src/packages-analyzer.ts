@@ -1,7 +1,12 @@
+import pLimit from 'p-limit';
 import { GitHubClient } from './github-client.js';
 
 // All package_type values the REST packages API accepts.
 export const PACKAGE_TYPES = ['npm', 'maven', 'rubygems', 'nuget', 'docker', 'container'];
+
+// Mirrors artifact-analyzer.ts's PROBE_CONCURRENCY / @octokit/plugin-throttling's
+// own global maxConcurrent default.
+export const VERSION_COLLECTION_CONCURRENCY = 10;
 
 // GitHub's GraphQL API only exposes PackageFile.size (byte sizes) for these
 // registries; npm/docker/container/nuget/rubygems have no size field in any
@@ -178,10 +183,14 @@ class GitHubPackagesAnalyzer extends GitHubClient {
       }
     }
 
-    for (const pkg of packages) {
-      await this.warnAndWaitIfQuotaLow();
-      this.onProgress(`Looking for versions of package ${pkg.name} (${pkg.packageType})...`);
+    // Collect every package's versions concurrently, bounded, instead of one
+    // package at a time - matches the concurrent-probing pattern already
+    // used for repos in artifact-analyzer.ts's filterRepositoriesWithArtifacts.
+    await this.warnAndWaitIfQuotaLow();
 
+    let collectedCount = 0;
+    const limit = pLimit(VERSION_COLLECTION_CONCURRENCY);
+    await Promise.all(packages.map(pkg => limit(async () => {
       try {
         pkg.versions = await this.collectPackageVersions(login, pkg.packageType, pkg.name, isOrg);
       } catch (error) {
@@ -191,7 +200,10 @@ class GitHubPackagesAnalyzer extends GitHubClient {
 
       const sizeKey = `${pkg.packageType}:${pkg.name}`;
       pkg.sizeBytes = mavenSizes.has(sizeKey) ? mavenSizes.get(sizeKey) : null;
-    }
+
+      collectedCount++;
+      this.onProgress(`Looking for package versions... (${collectedCount}/${packages.length})`);
+    })));
 
     const summary = {
       totalPackages: packages.length,
