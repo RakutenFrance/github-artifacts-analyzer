@@ -144,15 +144,19 @@ program
 
 program
   .command('analyze-org')
-  .description('Analyze artifacts across all repositories in an organization')
+  .description(
+    'Analyze artifacts and packages storage across all repositories in an organization. ' +
+    '--include-expired, --min-size, --top, and --cleanup apply to the artifacts analysis only - ' +
+    'the packages analysis (npm/Maven/container/etc.) always covers every package with no filtering.'
+  )
   .argument('<org>', 'GitHub organization name')
   .option('-t, --token <token>', 'GitHub Personal Access Token (or set GITHUB_TOKEN env var)')
   .option('-f, --format <format>', 'Output format (table|json|csv)', 'table')
   .option('-o, --output <file>', 'Output file path')
-  .option('--include-expired', 'Include expired artifacts in analysis', false)
-  .option('--min-size <bytes>', 'Minimum artifact size to include (in bytes)', parseNonNegativeInteger, 0)
-  .option('--top <count>', 'Show top N repositories by storage usage', parseNonNegativeInteger, 10)
-  .option('--cleanup', 'Interactive cleanup mode - delete artifacts to save space', false)
+  .option('--include-expired', 'Include expired artifacts in analysis (artifacts only, not packages)', false)
+  .option('--min-size <bytes>', 'Minimum artifact size to include, in bytes (artifacts only, not packages)', parseNonNegativeInteger, 0)
+  .option('--top <count>', 'Show top N repositories by storage usage (artifacts only, not packages)', parseNonNegativeInteger, 10)
+  .option('--cleanup', 'Interactive cleanup mode - delete artifacts to save space (artifacts only, not packages)', false)
   .action(async (org, options) => {
     const token = options.token || process.env.GITHUB_TOKEN;
     if (!token) {

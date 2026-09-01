@@ -49,3 +49,12 @@ test('rejects invalid --min-size and --top on analyze-org too', () => {
   assert.notEqual(topResult.status, 0);
   assert.match(topResult.stderr, /--top.*non-negative integer/);
 });
+
+test('documents that analyze-org filtering flags apply to artifacts only, not packages', () => {
+  const result = runCli('analyze-org', '--help');
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /packages analysis.*always covers every package with no filtering/s);
+  assert.match(result.stdout, /--include-expired.*\(artifacts only, not packages\)/s);
+  assert.match(result.stdout, /--min-size.*\(artifacts only, not packages\)/s);
+});
