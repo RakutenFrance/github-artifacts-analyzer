@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import { GitHubArtifactsAnalyzer, PROBE_CONCURRENCY } from '../dist/artifact-analyzer.js';
+import { GitHubArtifactsAnalyzer, PROBE_CONCURRENCY, WORKFLOW_RUN_LOOKBACK_BUFFER_MS } from '../dist/artifact-analyzer.js';
 import { ReportGenerator } from '../dist/reporter.js';
 
 // listArtifactsForRepo is called two different ways: directly, as the pass-2
@@ -100,7 +100,11 @@ test('attributes each artifact to its workflow name via the run lookup', async (
   );
 });
 
-test('filters the run lookup to runs no older than the oldest surviving artifact', async () => {
+test('filters the run lookup to runs no older than a lookback buffer before the oldest surviving artifact', async () => {
+  // A run's created_at is stamped when it starts, before it finishes and
+  // uploads an artifact - so the filter must look back from the oldest
+  // artifact's date, not use that date as the cutoff itself, or it would
+  // exclude the very run that produced the oldest surviving artifact.
   let artifactsPage = 0;
   let seenCreatedFilter;
   const analyzer = createAnalyzer({
@@ -131,7 +135,37 @@ test('filters the run lookup to runs no older than the oldest surviving artifact
 
   await analyzer.analyzeRepository('owner', 'repo');
 
-  assert.equal(seenCreatedFilter, '>=2026-01-01T00:00:00.000Z');
+  const expectedCutoff = new Date(Date.parse('2026-01-01T00:00:00Z') - WORKFLOW_RUN_LOOKBACK_BUFFER_MS);
+  assert.equal(seenCreatedFilter, `>=${expectedCutoff.toISOString()}`);
+});
+
+test('attributes an artifact to a run that started before the artifact was created', async () => {
+  // Reproduces the real-world case a fixed-cutoff filter would miss: the run
+  // that produced the oldest surviving artifact started hours earlier.
+  let artifactsPage = 0;
+  let runsPage = 0;
+  const runCreatedAt = new Date(Date.parse('2026-01-01T00:00:00Z') - 60 * 60 * 1000).toISOString();
+  const analyzer = createAnalyzer({
+    actions: {
+      listRepoWorkflows: async () => ({ data: workflowFixture() }),
+      listWorkflowRunsForRepo: async () => ({
+        data: runsPage++ === 0 ? [{ id: 200, workflow_id: 10, created_at: runCreatedAt }] : [],
+      }),
+      listArtifactsForRepo: async () => ({
+        data: artifactsPage++ === 0
+          ? [{
+            id: 2, name: 'older', size_in_bytes: 10, expired: false,
+            created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z', expires_at: '2027-01-01T00:00:00Z',
+            workflow_run: { id: 200 },
+          }]
+          : [],
+      }),
+    },
+  });
+
+  const analysis = await analyzer.analyzeRepository('owner', 'repo');
+
+  assert.equal(analysis.artifacts[0].workflowName, 'Build');
 });
 
 test('marks a repository incomplete when the workflow run lookup fails', async () => {

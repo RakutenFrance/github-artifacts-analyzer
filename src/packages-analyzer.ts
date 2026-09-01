@@ -13,7 +13,9 @@ class GitHubPackagesAnalyzer extends GitHubClient {
   // Sums real byte sizes for every Maven package via GraphQL's PackageFile.size.
   // Page sizes are kept small (10 packages x 20 versions x 10 files) - a wider
   // query easily exceeds GitHub's GraphQL node-count resource limit for orgs
-  // with many versions per package. Returns a Map of package name -> bytes.
+  // with many versions per package. Returns a Map of "maven:<name>" -> bytes,
+  // namespaced by package type so a same-named non-Maven package can never
+  // collide with (and silently inherit) a Maven package's size.
   private async fetchMavenPackageSizes(login) {
     const sizeByPackageName = new Map();
     let hasNextPage = true;
@@ -61,7 +63,7 @@ class GitHubPackagesAnalyzer extends GitHubClient {
         const totalSize = pkg.versions.nodes
           .flatMap(v => v.files.nodes)
           .reduce((sum, file) => sum + file.size, 0);
-        sizeByPackageName.set(pkg.name, totalSize);
+        sizeByPackageName.set(`maven:${pkg.name}`, totalSize);
       }
 
       hasNextPage = packages.pageInfo.hasNextPage;
@@ -141,10 +143,15 @@ class GitHubPackagesAnalyzer extends GitHubClient {
 
     const { packages, warnings } = await this.listPackages(login, isOrg);
 
+    // sizeKnown is derived from whether the Maven fetch actually succeeded,
+    // not just from the package type - a failed/partial fetch must report
+    // "unknown", never a false "0 B".
     let mavenSizes = new Map();
+    let mavenSizeFetchSucceeded = false;
     if (packages.some(pkg => pkg.packageType in PACKAGE_TYPES_WITH_KNOWN_SIZE)) {
       try {
         mavenSizes = await this.fetchMavenPackageSizes(login);
+        mavenSizeFetchSucceeded = true;
       } catch (error) {
         warnings.push(`Fetching Maven package sizes: ${this.describeError(error)}`);
       }
@@ -161,7 +168,8 @@ class GitHubPackagesAnalyzer extends GitHubClient {
         pkg.versions = [];
       }
 
-      pkg.sizeBytes = mavenSizes.has(pkg.name) ? mavenSizes.get(pkg.name) : null;
+      const sizeKey = `${pkg.packageType}:${pkg.name}`;
+      pkg.sizeBytes = mavenSizes.has(sizeKey) ? mavenSizes.get(sizeKey) : null;
     }
 
     const summary = {
@@ -171,11 +179,12 @@ class GitHubPackagesAnalyzer extends GitHubClient {
       packagesWithUnknownSize: packages.filter(pkg => pkg.sizeBytes === null).length,
       byPackageType: PACKAGE_TYPES.reduce((byType, packageType) => {
         const ofType = packages.filter(pkg => pkg.packageType === packageType);
+        const sizeKnown = packageType in PACKAGE_TYPES_WITH_KNOWN_SIZE && mavenSizeFetchSucceeded;
         byType[packageType] = {
           packageCount: ofType.length,
           versionCount: ofType.reduce((sum, pkg) => sum + pkg.versions.length, 0),
           sizeBytes: ofType.reduce((sum, pkg) => sum + (pkg.sizeBytes ?? 0), 0),
-          sizeKnown: packageType in PACKAGE_TYPES_WITH_KNOWN_SIZE
+          sizeKnown
         };
         return byType;
       }, {})

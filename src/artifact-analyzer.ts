@@ -5,6 +5,12 @@ import { GitHubClient } from './github-client.js';
 // Mirrors @octokit/plugin-throttling's own global maxConcurrent default.
 export const PROBE_CONCURRENCY = 10;
 
+// A run's created_at is stamped when it starts, before it finishes and
+// uploads any artifact - so a run can be (and typically is) created earlier
+// than the artifact it produces. This buffer covers the vast majority of
+// workflow durations while still meaningfully narrowing the run-history scan.
+export const WORKFLOW_RUN_LOOKBACK_BUFFER_MS = 24 * 60 * 60 * 1000;
+
 class GitHubArtifactsAnalyzer extends GitHubClient {
   // Cheap, non-paginated existence check: does this repo have any artifacts
   // at all? Fails open (treats errors as "might have artifacts") so pass 3's
@@ -91,9 +97,14 @@ class GitHubArtifactsAnalyzer extends GitHubClient {
     const workflowNameById = new Map(analysis.workflows.map(w => [w.id, w.name]));
     const workflowNameByRunId = new Map();
 
-    // No run can be older than the oldest surviving artifact, so filter
-    // server-side instead of paginating the repo's entire run history.
-    const oldestArtifactDate = new Date(Math.min(...analysis.artifacts.map(a => a.createdAt.getTime())));
+    // Filter server-side instead of paginating the repo's entire run history.
+    // A lookback buffer is required: a run's created_at is stamped when it
+    // starts, before it finishes and uploads any artifact, so the run that
+    // produced the oldest surviving artifact is typically created earlier
+    // than that artifact, not later.
+    const oldestArtifactDate = new Date(
+      Math.min(...analysis.artifacts.map(a => a.createdAt.getTime())) - WORKFLOW_RUN_LOOKBACK_BUFFER_MS
+    );
 
     try {
       for await (const { data: runs } of this.octokit.paginate.iterator(
@@ -105,8 +116,10 @@ class GitHubArtifactsAnalyzer extends GitHubClient {
         }
       }
     } catch (error) {
+      // Apply whatever mappings were already collected from earlier pages
+      // instead of discarding them - a failure on a later page shouldn't
+      // also erase progress already made on runs from earlier pages.
       this.recordWarning(analysis, `Workflow run lookup: ${this.describeError(error)}`);
-      return;
     }
 
     for (const artifact of analysis.artifacts) {

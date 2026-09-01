@@ -128,6 +128,79 @@ test('sums real Maven byte sizes via GraphQL and leaves other types unknown', as
   assert.equal(result.summary.byPackageType.npm.sizeKnown, false);
 });
 
+test('reports Maven size as unknown, not a false 0 B, when the GraphQL size fetch fails', async () => {
+  let versionsPage = 0;
+  const analyzer = createPackagesAnalyzer({
+    packages: {
+      listPackagesForOrganization: packagesFixture('maven', [
+        {
+          name: 'com.rakuten.library', visibility: 'private',
+          created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-02T00:00:00Z',
+        },
+      ]),
+      getAllPackageVersionsForPackageOwnedByOrg: async () => ({
+        data: versionsPage++ === 0
+          ? [{ id: 1, name: '1.0.0', created_at: '2026-01-01T00:00:00Z' }]
+          : [],
+      }),
+    },
+  });
+
+  analyzer.octokit.graphql = async () => { throw new Error('GraphQL resource limit exceeded'); };
+
+  const result = await analyzer.analyzePackages('my-org', { isOrg: true });
+
+  assert.equal(result.packages[0].sizeBytes, null);
+  assert.equal(result.summary.byPackageType.maven.sizeKnown, false);
+  assert.equal(result.summary.byPackageType.maven.sizeBytes, 0);
+  assert.equal(result.incomplete, true);
+  assert.match(result.warnings[0], /Fetching Maven package sizes/);
+});
+
+test('does not let a Maven package leak its size onto a same-named package of a different type', async () => {
+  const packagesListedPerType = new Set();
+  const analyzer = createPackagesAnalyzer({
+    packages: {
+      listPackagesForOrganization: async ({ package_type }) => {
+        if (package_type !== 'npm' && package_type !== 'maven') return { data: [] };
+        if (packagesListedPerType.has(package_type)) return { data: [] };
+        packagesListedPerType.add(package_type);
+        return {
+          data: [{
+            name: 'shared-utils', visibility: 'private',
+            created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-02T00:00:00Z',
+          }],
+        };
+      },
+      // Every package's version pagination immediately returns empty -
+      // irrelevant to this test, which only checks size-key isolation.
+      getAllPackageVersionsForPackageOwnedByOrg: async () => ({ data: [] }),
+    },
+  });
+
+  analyzer.octokit.graphql = async () => ({
+    repositoryOwner: {
+      packages: {
+        pageInfo: { hasNextPage: false, endCursor: null },
+        nodes: [
+          {
+            name: 'shared-utils',
+            versions: { nodes: [{ files: { nodes: [{ size: 500 }] } }] },
+          },
+        ],
+      },
+    },
+  });
+
+  const result = await analyzer.analyzePackages('my-org', { isOrg: true });
+
+  const npmPkg = result.packages.find(p => p.packageType === 'npm');
+  const mavenPkg = result.packages.find(p => p.packageType === 'maven');
+
+  assert.equal(mavenPkg.sizeBytes, 500);
+  assert.equal(npmPkg.sizeBytes, null); // must stay unknown, not inherit maven's 500
+});
+
 test('tracks a package-type listing failure as a warning instead of aborting the scan', async () => {
   const analyzer = createPackagesAnalyzer({
     packages: {
