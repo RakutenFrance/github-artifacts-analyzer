@@ -19,6 +19,18 @@ function parseNonNegativeInteger(value) {
   return parseInt(value, 10);
 }
 
+// Isolated from the artifact scan that precedes it: an unexpected
+// packages-analysis failure shouldn't discard an already-completed,
+// potentially long-running artifact scan for the whole organization.
+async function runPackagesAnalysis(packagesAnalyzer, org) {
+  try {
+    return await packagesAnalyzer.analyzePackages(org, { isOrg: true });
+  } catch (error) {
+    console.error(chalk.yellow(`\n⚠ Packages analysis failed: ${error?.message || 'Unknown error'}`));
+    return null;
+  }
+}
+
 const program = new Command();
 
 program
@@ -161,7 +173,7 @@ program
         spinner.succeed('Analysis complete!');
         await reporter.runCleanupMode(analysis, analyzer);
       } else {
-        const packagesAnalysis = await packagesAnalyzer.analyzePackages(org, { isOrg: true });
+        const packagesAnalysis = await runPackagesAnalysis(packagesAnalyzer, org);
 
         spinner.succeed('Analysis complete!');
         await reporter.generateReport(analysis, {
@@ -182,4 +194,4 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   program.parse();
 }
 
-export { program };
+export { program, runPackagesAnalysis };
