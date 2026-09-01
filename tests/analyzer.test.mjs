@@ -775,6 +775,10 @@ test('reports a clear error when the token lacks read:org access', async () => {
   );
 });
 
+function emptyPackagesAnalysisFixture() {
+  return { packages: [], summary: { totalPackages: 0 }, incomplete: false, warnings: [] };
+}
+
 test('CSV reports include incomplete and skipped status metadata', () => {
   const directory = mkdtempSync(join(tmpdir(), 'artifact-report-'));
   const outputFile = join(directory, 'report.csv');
@@ -795,11 +799,43 @@ test('CSV reports include incomplete and skipped status metadata', () => {
         expiredSizeBytes: 0,
       }],
       skippedRepositories: [{ fullName: 'owner/skipped', reason: 'No access' }],
-    }, outputFile);
+    }, outputFile, emptyPackagesAnalysisFixture());
 
     const csv = readFileSync(outputFile, 'utf8');
     assert.match(csv, /owner\/partial,incomplete,"run failed, retry later"/);
     assert.match(csv, /owner\/skipped,skipped,No access/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('CSV reports always include a packages section, since packages analysis is unconditional', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'artifact-report-'));
+  const outputFile = join(directory, 'report.csv');
+  const reporter = new ReportGenerator();
+
+  try {
+    reporter.generateCsvReport(
+      { repositories: [], skippedRepositories: [] },
+      outputFile,
+      {
+        packages: [
+          {
+            name: 'com.rakuten.library', packageType: 'maven', repositoryFullName: 'org/lib',
+            versions: [{ id: 1 }, { id: 2 }], sizeBytes: 41847,
+          },
+          {
+            name: 'gtm-provider', packageType: 'npm', repositoryFullName: null,
+            versions: [{ id: 1 }], sizeBytes: null,
+          },
+        ],
+      }
+    );
+
+    const csv = readFileSync(outputFile, 'utf8');
+    assert.match(csv, /Package,Type,Repository,Versions,Size \(Bytes\),Size Known/);
+    assert.match(csv, /com\.rakuten\.library,maven,org\/lib,2,41847,true/);
+    assert.match(csv, /gtm-provider,npm,,1,,false/);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

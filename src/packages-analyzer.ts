@@ -9,6 +9,27 @@ export const PACKAGE_TYPES = ['npm', 'maven', 'rubygems', 'nuget', 'docker', 'co
 // doesn't scale (container layers can be gigabytes).
 const PACKAGE_TYPES_WITH_KNOWN_SIZE = { maven: 'MAVEN' };
 
+// A valid, empty analysis result - used whenever there's nothing to report
+// (the analysis wasn't run, or it failed outright), so callers always have a
+// real object to render instead of needing to branch on null/undefined.
+function emptyPackagesAnalysis(warning = null) {
+  return {
+    packages: [],
+    summary: {
+      totalPackages: 0,
+      totalVersions: 0,
+      totalSizeBytes: 0,
+      packagesWithUnknownSize: 0,
+      byPackageType: PACKAGE_TYPES.reduce((byType, packageType) => {
+        byType[packageType] = { packageCount: 0, versionCount: 0, sizeBytes: 0, sizeKnown: false };
+        return byType;
+      }, {})
+    },
+    incomplete: warning !== null,
+    warnings: warning !== null ? [warning] : []
+  };
+}
+
 class GitHubPackagesAnalyzer extends GitHubClient {
   // Sums real byte sizes for every Maven package via GraphQL's PackageFile.size.
   // Page sizes are kept small (10 packages x 20 versions x 10 files) - a wider
@@ -194,4 +215,4 @@ class GitHubPackagesAnalyzer extends GitHubClient {
   }
 }
 
-export { GitHubPackagesAnalyzer };
+export { GitHubPackagesAnalyzer, emptyPackagesAnalysis };

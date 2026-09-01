@@ -4,20 +4,18 @@ import { writeFileSync } from 'fs';
 import * as readline from 'readline';
 
 class ReportGenerator {
-  async generateReport(analysis, options, packagesAnalysis = null) {
+  async generateReport(analysis, options, packagesAnalysis) {
     switch (options.format) {
       case 'json':
         this.generateJsonReport(analysis, options.outputFile, packagesAnalysis);
         break;
       case 'csv':
-        this.generateCsvReport(analysis, options.outputFile);
+        this.generateCsvReport(analysis, options.outputFile, packagesAnalysis);
         break;
       case 'table':
       default:
         this.generateTableReport(analysis, options.topCount || 10);
-        if (packagesAnalysis) {
-          this.generatePackagesTableReport(packagesAnalysis);
-        }
+        this.generatePackagesTableReport(packagesAnalysis);
         break;
     }
   }
@@ -280,12 +278,8 @@ class ReportGenerator {
     console.log(artifactTable.toString());
   }
 
-  generateJsonReport(analysis, outputFile, packagesAnalysis = null) {
-    const jsonOutput = JSON.stringify(
-      packagesAnalysis ? { ...analysis, packages: packagesAnalysis } : analysis,
-      null,
-      2
-    );
+  generateJsonReport(analysis, outputFile, packagesAnalysis) {
+    const jsonOutput = JSON.stringify({ ...analysis, packages: packagesAnalysis }, null, 2);
 
     if (outputFile) {
       writeFileSync(outputFile, jsonOutput);
@@ -295,9 +289,9 @@ class ReportGenerator {
     }
   }
 
-  generateCsvReport(analysis, outputFile) {
+  generateCsvReport(analysis, outputFile, packagesAnalysis) {
     const csvLines = ['Repository,Status,Error,Workflows,Total Artifacts,Total Size (Bytes),Active Artifacts,Active Size (Bytes),Expired Artifacts,Expired Size (Bytes)'];
-    
+
     for (const repo of analysis.repositories) {
       csvLines.push([
         this.escapeCsv(repo.fullName),
@@ -319,6 +313,19 @@ class ReportGenerator {
         'skipped',
         this.escapeCsv(skipped.reason),
         '', '', '', '', '', '', ''
+      ].join(','));
+    }
+
+    csvLines.push('');
+    csvLines.push('Package,Type,Repository,Versions,Size (Bytes),Size Known');
+    for (const pkg of packagesAnalysis.packages) {
+      csvLines.push([
+        this.escapeCsv(pkg.name),
+        pkg.packageType,
+        this.escapeCsv(pkg.repositoryFullName || ''),
+        pkg.versions.length.toString(),
+        (pkg.sizeBytes ?? '').toString(),
+        (pkg.sizeBytes !== null).toString()
       ].join(','));
     }
 

@@ -3,7 +3,7 @@
 import * as dotenv from 'dotenv';
 import { Command, InvalidArgumentError } from 'commander';
 import { GitHubArtifactsAnalyzer } from './artifact-analyzer.js';
-import { GitHubPackagesAnalyzer } from './packages-analyzer.js';
+import { GitHubPackagesAnalyzer, emptyPackagesAnalysis } from './packages-analyzer.js';
 import { ReportGenerator } from './reporter.js';
 import chalk from 'chalk';
 import ora from 'ora';
@@ -21,13 +21,16 @@ function parseNonNegativeInteger(value) {
 
 // Isolated from the artifact scan that precedes it: an unexpected
 // packages-analysis failure shouldn't discard an already-completed,
-// potentially long-running artifact scan for the whole organization.
+// potentially long-running artifact scan for the whole organization. Returns
+// a valid, empty analysis on failure so callers never need to branch on
+// whether a result exists.
 async function runPackagesAnalysis(packagesAnalyzer, org) {
   try {
     return await packagesAnalyzer.analyzePackages(org, { isOrg: true });
   } catch (error) {
-    console.error(chalk.yellow(`\n⚠ Packages analysis failed: ${error?.message || 'Unknown error'}`));
-    return null;
+    const message = error?.message || 'Unknown error';
+    console.error(chalk.yellow(`\n⚠ Packages analysis failed: ${message}`));
+    return emptyPackagesAnalysis(`Packages analysis failed: ${message}`);
   }
 }
 
@@ -79,11 +82,13 @@ program
       if (options.cleanup) {
         await reporter.runCleanupMode(analysis, analyzer);
       } else {
+        // Packages analysis is scoped to analyze-org; this command has no
+        // real packages fetch to run, so pass a valid "nothing to report" result.
         await reporter.generateReport(analysis, {
           format: options.format,
           outputFile: options.output,
           topCount: options.top,
-        });
+        }, emptyPackagesAnalysis());
       }
 
     } catch (error) {
@@ -169,13 +174,15 @@ program
         minSize: options.minSize,
       });
 
+      // Always run, regardless of --cleanup, so packages analysis never
+      // depends on which mode the command is in.
+      const packagesAnalysis = await runPackagesAnalysis(packagesAnalyzer, org);
+
+      spinner.succeed('Analysis complete!');
+
       if (options.cleanup) {
-        spinner.succeed('Analysis complete!');
         await reporter.runCleanupMode(analysis, analyzer);
       } else {
-        const packagesAnalysis = await runPackagesAnalysis(packagesAnalyzer, org);
-
-        spinner.succeed('Analysis complete!');
         await reporter.generateReport(analysis, {
           format: options.format,
           outputFile: options.output,
