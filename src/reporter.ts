@@ -14,7 +14,7 @@ class ReportGenerator {
         break;
       case 'table':
       default:
-        this.generateTableReport(analysis, options.topCount || 10);
+        this.generateTableReport(analysis, options.topCount);
         this.generatePackagesTableReport(packagesAnalysis);
         break;
     }

@@ -841,6 +841,31 @@ test('CSV reports always include a packages section, since packages analysis is 
   }
 });
 
+test('honors an explicit --top 0 instead of falling back to the default of 10', () => {
+  const reporter = new ReportGenerator();
+  const logged = [];
+  const originalLog = console.log;
+  console.log = (...args) => logged.push(args.join(' '));
+
+  try {
+    reporter.generateTableReport({
+      incomplete: false,
+      organizationName: null,
+      summary: {
+        totalRepositories: 1, repositoriesWithWorkflows: 1, repositoriesWithArtifacts: 1,
+        totalArtifacts: 1, totalSizeBytes: 500, activeArtifacts: 0, activeSizeBytes: 0,
+        expiredArtifacts: 1, expiredSizeBytes: 500,
+      },
+      repositories: [repoWithArtifactsFixture('owner/repo1')],
+    }, 0);
+  } finally {
+    console.log = originalLog;
+  }
+
+  assert.ok(!logged.some(line => line.includes('Top 10 Repositories')));
+  assert.ok(!logged.some(line => line.includes('owner/repo1')));
+});
+
 function repoWithArtifactsFixture(fullName) {
   return {
     fullName,
