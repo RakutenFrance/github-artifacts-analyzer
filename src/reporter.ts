@@ -161,7 +161,7 @@ class ReportGenerator {
         packageType,
         stats.packageCount.toLocaleString(),
         stats.versionCount.toLocaleString(),
-        stats.sizeKnown ? this.formatBytes(stats.sizeBytes) : chalk.gray('unknown')
+        this.formatPackageTypeSize(stats)
       ]);
     }
 
@@ -169,9 +169,10 @@ class ReportGenerator {
 
     if (summary.packagesWithUnknownSize > 0) {
       console.log(chalk.gray(
-        '\nNote: GitHub does not expose byte sizes for npm, Docker/container, NuGet, ' +
-        'or RubyGems packages via any documented API - only Maven package sizes ' +
-        'above are real byte counts. Version counts are still accurate for all types.'
+        '\nNote: GitHub does not expose byte sizes for Docker/container, NuGet, or RubyGems ' +
+        'packages via any documented API. Maven sizes above are real byte counts; npm sizes ' +
+        'are estimated by sampling a subset of each package\'s versions and extrapolating ' +
+        '(marked "~"). Version counts are accurate for all types.'
       ));
     }
 
@@ -196,12 +197,22 @@ class ReportGenerator {
           pkg.packageType,
           pkg.repositoryFullName || chalk.gray('unknown'),
           pkg.versions.length.toLocaleString(),
-          pkg.sizeBytes === null ? chalk.gray('unknown') : this.formatBytes(pkg.sizeBytes)
+          this.formatPackageSize(pkg)
         ]);
       }
 
       console.log(topTable.toString());
     }
+  }
+
+  formatPackageTypeSize(stats) {
+    if (!stats.sizeKnown) return chalk.gray('unknown');
+    return stats.sizeEstimated ? `~${this.formatBytes(stats.sizeBytes)}` : this.formatBytes(stats.sizeBytes);
+  }
+
+  formatPackageSize(pkg) {
+    if (pkg.sizeBytes === null) return chalk.gray('unknown');
+    return pkg.sizeEstimated ? `~${this.formatBytes(pkg.sizeBytes)}` : this.formatBytes(pkg.sizeBytes);
   }
 
   generateRepositoryTableReport(analysis) {
@@ -317,7 +328,7 @@ class ReportGenerator {
     }
 
     csvLines.push('');
-    csvLines.push('Package,Type,Repository,Versions,Size (Bytes),Size Known');
+    csvLines.push('Package,Type,Repository,Versions,Size (Bytes),Size Known,Size Estimated');
     for (const pkg of packagesAnalysis.packages) {
       csvLines.push([
         this.escapeCsv(pkg.name),
@@ -325,7 +336,8 @@ class ReportGenerator {
         this.escapeCsv(pkg.repositoryFullName || ''),
         pkg.versions.length.toString(),
         (pkg.sizeBytes ?? '').toString(),
-        (pkg.sizeBytes !== null).toString()
+        (pkg.sizeBytes !== null).toString(),
+        (pkg.sizeEstimated ?? false).toString()
       ].join(','));
     }
 

@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { GitHubPackagesAnalyzer, PACKAGE_TYPES, VERSION_COLLECTION_CONCURRENCY } from '../dist/packages-analyzer.js';
+import {
+  GitHubPackagesAnalyzer, PACKAGE_TYPES, VERSION_COLLECTION_CONCURRENCY,
+  sampleSizeFor, pickVersionsToSample,
+} from '../dist/packages-analyzer.js';
 
 // listPackagesForOrganization/listPackagesForUser require a package_type
 // filter and don't accept "all" - the analyzer loops over every known
@@ -45,7 +48,42 @@ function packagesFixture(packageType, packages) {
   };
 }
 
-test('lists packages across every package type and paginates their versions', async () => {
+// estimateNpmPackageSize makes two kinds of real fetch() calls: one GET to
+// npm.pkg.github.com for the registry metadata document, then one GET
+// (redirect: manual) + one HEAD per sampled version's tarball. Stubs
+// globalThis.fetch for the duration of the test and restores it afterward.
+function withMockedNpmFetch(versionSizes, fn) {
+  return async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init = {}) => {
+      if (typeof url === 'string' && url.startsWith('https://npm.pkg.github.com/@') && !init.method) {
+        const versions = Object.fromEntries(
+          Object.keys(versionSizes).map(name => [name, { dist: { tarball: `https://npm.pkg.github.com/download/x/${name}` } }])
+        );
+        return new Response(JSON.stringify({ versions }), { status: 200 });
+      }
+      if (init.redirect === 'manual') {
+        const version = url.split('/').pop();
+        return new Response(null, { status: 302, headers: { location: `https://blob.example.com/${version}` } });
+      }
+      if (init.method === 'HEAD') {
+        const version = url.split('/').pop();
+        const size = versionSizes[version];
+        if (size === undefined) return new Response(null, { status: 404 });
+        return new Response(null, { status: 200, headers: { 'content-length': String(size) } });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    try {
+      await fn();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  };
+}
+
+test('lists packages across every package type and paginates their versions', withMockedNpmFetch({ '1.0.0': 1000 }, async () => {
   let versionsPage = 0;
   const analyzer = createPackagesAnalyzer({
     packages: {
@@ -69,8 +107,9 @@ test('lists packages across every package type and paginates their versions', as
   assert.equal(result.summary.totalVersions, 1);
   assert.equal(result.packages[0].name, 'gtm-provider');
   assert.equal(result.packages[0].packageType, 'npm');
-  assert.equal(result.packages[0].sizeBytes, null); // npm has no known size
-});
+  assert.equal(result.packages[0].sizeBytes, 1000); // estimated from its one sampled version
+  assert.equal(result.packages[0].sizeEstimated, true);
+}));
 
 test('reports every known package_type value, not just the ones with data', async () => {
   const seenTypes = [];
@@ -271,4 +310,102 @@ test('bounds concurrent package version collection to the configured limit', asy
 
   assert.ok(maxInFlight <= VERSION_COLLECTION_CONCURRENCY);
   assert.ok(maxInFlight > 1); // proves version collection actually ran concurrently, not serially
+});
+
+test('sampleSizeFor scales log2, staying within the configured min/max bounds', () => {
+  assert.equal(sampleSizeFor(0), 0);
+  assert.equal(sampleSizeFor(1), 1);
+  assert.equal(sampleSizeFor(3), 3); // at/below the minimum: sample everything
+  assert.equal(sampleSizeFor(4), 3); // log2(4) = 2, floored up to the minimum of 3
+  assert.equal(sampleSizeFor(100), 7); // ceil(log2(100)) = 7
+  assert.equal(sampleSizeFor(1024), 10); // ceil(log2(1024)) = 10, at the max
+  assert.equal(sampleSizeFor(1_000_000), 10); // never exceeds the configured max
+});
+
+test('pickVersionsToSample always includes the latest version and samples the rest', () => {
+  const versions = Array.from({ length: 10 }, (_, i) => ({ name: `v${i}` }));
+
+  const sample = pickVersionsToSample(versions, 4);
+
+  assert.equal(sample.length, 4);
+  assert.equal(sample[0], versions[0]); // latest (first in the array) always included
+  assert.equal(new Set(sample.map(v => v.name)).size, 4); // no duplicates
+});
+
+test('pickVersionsToSample returns every version when there are fewer than the sample size', () => {
+  const versions = [{ name: 'v0' }, { name: 'v1' }];
+
+  const sample = pickVersionsToSample(versions, 5);
+
+  assert.deepEqual(sample, versions);
+});
+
+test('estimates npm package size from a sample of real tarball sizes, extrapolated to every version', withMockedNpmFetch(
+  { '3.0.0': 1000, '2.0.0': 2000, '1.0.0': 3000 },
+  async () => {
+    let versionsPage = 0;
+    const analyzer = createPackagesAnalyzer({
+      packages: {
+        listPackagesForOrganization: packagesFixture('npm', [
+          {
+            name: 'gtm-provider', visibility: 'private',
+            created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-02T00:00:00Z',
+          },
+        ]),
+        getAllPackageVersionsForPackageOwnedByOrg: async () => ({
+          data: versionsPage++ === 0
+            ? [
+              { id: 3, name: '3.0.0', created_at: '2026-03-01T00:00:00Z' },
+              { id: 2, name: '2.0.0', created_at: '2026-02-01T00:00:00Z' },
+              { id: 1, name: '1.0.0', created_at: '2026-01-01T00:00:00Z' },
+            ]
+            : [],
+        }),
+      },
+    });
+
+    const result = await analyzer.analyzePackages('my-org', { isOrg: true });
+
+    // 3 versions <= NPM_SIZE_SAMPLE_MIN, so every version is sampled:
+    // average(1000, 2000, 3000) * 3 versions = 6000.
+    assert.equal(result.packages[0].sizeBytes, 6000);
+    assert.equal(result.packages[0].sizeEstimated, true);
+    assert.equal(result.packages[0].sampleCount, 3);
+    assert.equal(result.summary.byPackageType.npm.sizeKnown, true);
+    assert.equal(result.summary.byPackageType.npm.sizeEstimated, true);
+  }
+));
+
+test('reports npm size as unknown when every sampled tarball lookup fails', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => { throw new Error('network unreachable'); };
+
+  let versionsPage = 0;
+  const analyzer = createPackagesAnalyzer({
+    packages: {
+      listPackagesForOrganization: packagesFixture('npm', [
+        {
+          name: 'gtm-provider', visibility: 'private',
+          created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-02T00:00:00Z',
+        },
+      ]),
+      getAllPackageVersionsForPackageOwnedByOrg: async () => ({
+        data: versionsPage++ === 0
+          ? [{ id: 1, name: '1.0.0', created_at: '2026-01-01T00:00:00Z' }]
+          : [],
+      }),
+    },
+  });
+
+  let result;
+  try {
+    result = await analyzer.analyzePackages('my-org', { isOrg: true });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(result.packages[0].sizeBytes, null);
+  assert.equal(result.summary.byPackageType.npm.sizeKnown, false);
+  assert.equal(result.incomplete, true);
+  assert.match(result.warnings.join('; '), /Estimating size for npm package/);
 });

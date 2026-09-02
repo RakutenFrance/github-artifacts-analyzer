@@ -822,20 +822,20 @@ test('CSV reports always include a packages section, since packages analysis is 
         packages: [
           {
             name: 'com.rakuten.library', packageType: 'maven', repositoryFullName: 'org/lib',
-            versions: [{ id: 1 }, { id: 2 }], sizeBytes: 41847,
+            versions: [{ id: 1 }, { id: 2 }], sizeBytes: 41847, sizeEstimated: false,
           },
           {
             name: 'gtm-provider', packageType: 'npm', repositoryFullName: null,
-            versions: [{ id: 1 }], sizeBytes: null,
+            versions: [{ id: 1 }], sizeBytes: null, sizeEstimated: false,
           },
         ],
       }
     );
 
     const csv = readFileSync(outputFile, 'utf8');
-    assert.match(csv, /Package,Type,Repository,Versions,Size \(Bytes\),Size Known/);
-    assert.match(csv, /com\.rakuten\.library,maven,org\/lib,2,41847,true/);
-    assert.match(csv, /gtm-provider,npm,,1,,false/);
+    assert.match(csv, /Package,Type,Repository,Versions,Size \(Bytes\),Size Known,Size Estimated/);
+    assert.match(csv, /com\.rakuten\.library,maven,org\/lib,2,41847,true,false/);
+    assert.match(csv, /gtm-provider,npm,,1,,false,false/);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

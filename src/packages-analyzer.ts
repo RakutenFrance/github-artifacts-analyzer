@@ -8,11 +8,36 @@ export const PACKAGE_TYPES = ['npm', 'maven', 'rubygems', 'nuget', 'docker', 'co
 // own global maxConcurrent default.
 export const VERSION_COLLECTION_CONCURRENCY = 10;
 
-// GitHub's GraphQL API only exposes PackageFile.size (byte sizes) for these
-// registries; npm/docker/container/nuget/rubygems have no size field in any
-// documented API short of resolving each version's real download URL, which
-// doesn't scale (container layers can be gigabytes).
+// GitHub's GraphQL API exposes exact byte sizes (PackageFile.size) only for
+// Maven/Debian/PyPI. npm sizes are instead estimated (see sampleSizeFor) via
+// HEAD requests against the npm registry's tarball URLs - real but sampled,
+// not an exact count. docker/container/nuget/rubygems have no size signal at
+// all short of downloading every version's full contents, which doesn't scale.
 const PACKAGE_TYPES_WITH_KNOWN_SIZE = { maven: 'MAVEN' };
+const PACKAGE_TYPES_WITH_ESTIMATED_SIZE = { npm: true };
+
+// How many of a package's versions to sample when estimating its size (npm).
+// log2-scaled so packages with hundreds/thousands of versions don't blow up
+// request count, while still sampling more from genuinely large packages.
+// Below minSamples, just sample everything - one bad sample skews too much.
+const NPM_SIZE_SAMPLE_MIN = 3;
+const NPM_SIZE_SAMPLE_MAX = 10;
+
+export function sampleSizeFor(versionCount) {
+  if (versionCount <= NPM_SIZE_SAMPLE_MIN) return versionCount;
+  return Math.min(NPM_SIZE_SAMPLE_MAX, Math.max(NPM_SIZE_SAMPLE_MIN, Math.ceil(Math.log2(versionCount))));
+}
+
+// Picks which versions to sample: always the latest, then a random subset of
+// the rest - avoids bias toward only-recent or only-old sizes (e.g. a
+// package that ballooned in size after some point in its history).
+export function pickVersionsToSample(versions, sampleSize) {
+  if (versions.length <= sampleSize) return versions;
+
+  const [latest, ...rest] = versions;
+  const shuffled = rest.slice().sort(() => Math.random() - 0.5);
+  return [latest, ...shuffled.slice(0, sampleSize - 1)];
+}
 
 // A valid, empty analysis result - used whenever there's nothing to report
 // (the analysis wasn't run, or it failed outright), so callers always have a
@@ -26,7 +51,10 @@ function emptyPackagesAnalysis(warning = null) {
       totalSizeBytes: 0,
       packagesWithUnknownSize: 0,
       byPackageType: PACKAGE_TYPES.reduce((byType, packageType) => {
-        byType[packageType] = { packageCount: 0, versionCount: 0, sizeBytes: 0, sizeKnown: false };
+        byType[packageType] = {
+          packageCount: 0, versionCount: 0, sizeBytes: 0, sizeKnown: false,
+          sizeEstimated: packageType in PACKAGE_TYPES_WITH_ESTIMATED_SIZE
+        };
         return byType;
       }, {})
     },
@@ -97,6 +125,67 @@ class GitHubPackagesAnalyzer extends GitHubClient {
     }
 
     return sizeByPackageName;
+  }
+
+  // Reads a sampled version's real tarball size with zero data transfer: one
+  // GET to resolve the tarball's redirect location (npm.pkg.github.com does
+  // not support HEAD directly), then a HEAD against that final blob URL for
+  // Content-Length. Neither request touches the GitHub REST API's rate limit
+  // (confirmed: a separate host, no effect on x-ratelimit-remaining).
+  private async fetchNpmTarballSize(tarballUrl) {
+    const redirectResponse = await fetch(tarballUrl, {
+      method: 'GET',
+      redirect: 'manual',
+      headers: { Authorization: `Bearer ${this.token}` }
+    });
+
+    const blobUrl = redirectResponse.headers.get('location');
+    if (!blobUrl) throw new Error(`No redirect location for ${tarballUrl}`);
+
+    const headResponse = await fetch(blobUrl, { method: 'HEAD' });
+    const contentLength = headResponse.headers.get('content-length');
+    if (contentLength === null) throw new Error(`No Content-Length for ${blobUrl}`);
+
+    return Number(contentLength);
+  }
+
+  // Estimates one npm package's total size from a sample of its versions'
+  // real tarball sizes (see sampleSizeFor/pickVersionsToSample), rather than
+  // downloading or measuring every version. Returns null if every sampled
+  // version's size lookup failed.
+  private async estimateNpmPackageSize(login, packageName, versions) {
+    if (versions.length === 0) return null;
+
+    const sampleSize = sampleSizeFor(versions.length);
+    const sampled = pickVersionsToSample(versions, sampleSize);
+
+    const registryResponse = await fetch(`https://npm.pkg.github.com/@${login}/${packageName}`, {
+      headers: { Authorization: `Bearer ${this.token}` }
+    });
+    if (!registryResponse.ok) {
+      throw new Error(`Fetching npm registry metadata: HTTP ${registryResponse.status}`);
+    }
+    const registryData: any = await registryResponse.json();
+
+    const limit = pLimit(VERSION_COLLECTION_CONCURRENCY);
+    const sizes = await Promise.all(sampled.map(version => limit(async () => {
+      const tarballUrl = registryData.versions?.[version.name]?.dist?.tarball;
+      if (!tarballUrl) return null;
+      try {
+        return await this.fetchNpmTarballSize(tarballUrl);
+      } catch {
+        return null;
+      }
+    })));
+
+    const resolvedSizes = sizes.filter(size => size !== null);
+    if (resolvedSizes.length === 0) return null;
+
+    const averageSize = resolvedSizes.reduce((sum, size) => sum + size, 0) / resolvedSizes.length;
+    return {
+      estimatedTotalBytes: Math.round(averageSize * versions.length),
+      sampleCount: resolvedSizes.length
+    };
   }
 
   // Paginates every version of one package to surface per-version tags/dates -
@@ -200,6 +289,20 @@ class GitHubPackagesAnalyzer extends GitHubClient {
 
       const sizeKey = `${pkg.packageType}:${pkg.name}`;
       pkg.sizeBytes = mavenSizes.has(sizeKey) ? mavenSizes.get(sizeKey) : null;
+      pkg.sizeEstimated = false;
+
+      if (pkg.packageType === 'npm') {
+        try {
+          const estimate = await this.estimateNpmPackageSize(login, pkg.name, pkg.versions);
+          if (estimate) {
+            pkg.sizeBytes = estimate.estimatedTotalBytes;
+            pkg.sizeEstimated = true;
+            pkg.sampleCount = estimate.sampleCount;
+          }
+        } catch (error) {
+          warnings.push(`Estimating size for npm package ${pkg.name}: ${this.describeError(error)}`);
+        }
+      }
 
       collectedCount++;
       this.onProgress(`Looking for package versions... (${collectedCount}/${packages.length})`);
@@ -212,12 +315,15 @@ class GitHubPackagesAnalyzer extends GitHubClient {
       packagesWithUnknownSize: packages.filter(pkg => pkg.sizeBytes === null).length,
       byPackageType: PACKAGE_TYPES.reduce((byType, packageType) => {
         const ofType = packages.filter(pkg => pkg.packageType === packageType);
-        const sizeKnown = packageType in PACKAGE_TYPES_WITH_KNOWN_SIZE && mavenSizeFetchSucceeded;
+        const sizeKnown = (packageType in PACKAGE_TYPES_WITH_KNOWN_SIZE && mavenSizeFetchSucceeded)
+          || (packageType in PACKAGE_TYPES_WITH_ESTIMATED_SIZE && ofType.some(pkg => pkg.sizeBytes !== null));
+        const sizeEstimated = packageType in PACKAGE_TYPES_WITH_ESTIMATED_SIZE;
         byType[packageType] = {
           packageCount: ofType.length,
           versionCount: ofType.reduce((sum, pkg) => sum + pkg.versions.length, 0),
           sizeBytes: ofType.reduce((sum, pkg) => sum + (pkg.sizeBytes ?? 0), 0),
-          sizeKnown
+          sizeKnown,
+          sizeEstimated
         };
         return byType;
       }, {})

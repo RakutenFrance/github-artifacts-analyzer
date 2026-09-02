@@ -8,11 +8,13 @@ const Octokit = OctokitRest.plugin(throttling);
 // both the artifacts analyzer and the packages analyzer.
 class GitHubClient {
   protected octokit: InstanceType<typeof Octokit>;
+  protected token: string;
   private remainingRequests: number | null = null;
   private rateLimitResetAt: Date | null = null;
   protected onProgress: (message: string) => void;
 
   constructor(token, { onProgress = (_message: string) => {} } = {}) {
+    this.token = token;
     this.onProgress = onProgress;
     this.octokit = new Octokit({
       auth: token,
