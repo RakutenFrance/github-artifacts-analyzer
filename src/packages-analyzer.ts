@@ -1,6 +1,7 @@
 import pLimit from 'p-limit';
 import { GitHubClient } from './github-client.js';
 import { estimatePackageSize as estimateNpmPackageSize } from './npm-registry-client.js';
+import { estimatePackageSize as estimateContainerPackageSize } from './container-registry-client.js';
 
 // All package_type values the REST packages API accepts.
 export const PACKAGE_TYPES = ['npm', 'maven', 'rubygems', 'nuget', 'docker', 'container'];
@@ -10,12 +11,13 @@ export const PACKAGE_TYPES = ['npm', 'maven', 'rubygems', 'nuget', 'docker', 'co
 export const VERSION_COLLECTION_CONCURRENCY = 10;
 
 // GitHub's GraphQL API exposes exact byte sizes (PackageFile.size) only for
-// Maven/Debian/PyPI. npm sizes are instead estimated (see npm-registry-client.ts)
-// via HEAD requests against the npm registry's tarball URLs - real but sampled,
-// not an exact count. docker/container/nuget/rubygems have no size signal at
-// all short of downloading every version's full contents, which doesn't scale.
+// Maven/Debian/PyPI. npm and container sizes are instead estimated (see
+// npm-registry-client.ts / container-registry-client.ts) by sampling a few
+// versions and extrapolating - real but sampled, not an exact count.
+// docker/nuget/rubygems have no size signal at all short of downloading
+// every version's full contents, which doesn't scale.
 const PACKAGE_TYPES_WITH_KNOWN_SIZE = { maven: 'MAVEN' };
-const PACKAGE_TYPES_WITH_ESTIMATED_SIZE = { npm: true };
+const PACKAGE_TYPES_WITH_ESTIMATED_SIZE = { npm: true, container: true };
 
 // A valid, empty analysis result - used whenever there's nothing to report
 // (the analysis wasn't run, or it failed outright), so callers always have a
@@ -169,7 +171,7 @@ class GitHubPackagesAnalyzer extends GitHubClient {
   }
 
   // Lists every package of every type for the org/user, with per-version
-  // metadata and, where GitHub exposes it (Maven exact, npm estimated), byte sizes.
+  // metadata and, where GitHub exposes it (Maven exact, npm/container estimated), byte sizes.
   async analyzePackages(login, { isOrg = true } = {}) {
     this.onProgress(`Fetching packages for ${login}...`);
 
@@ -218,6 +220,19 @@ class GitHubPackagesAnalyzer extends GitHubClient {
           }
         } catch (error) {
           warnings.push(`Estimating size for npm package ${pkg.name}: ${this.describeError(error)}`);
+        }
+      }
+
+      if (pkg.packageType === 'container') {
+        try {
+          const estimate = await estimateContainerPackageSize(this.token, login, pkg.name, pkg.versions);
+          if (estimate) {
+            pkg.sizeBytes = estimate.estimatedTotalBytes;
+            pkg.sizeEstimated = true;
+            pkg.sampleCount = estimate.sampleCount;
+          }
+        } catch (error) {
+          warnings.push(`Estimating size for container package ${pkg.name}: ${this.describeError(error)}`);
         }
       }
 

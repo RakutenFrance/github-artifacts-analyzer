@@ -80,6 +80,34 @@ function withMockedNpmFetch(versionSizes, fn) {
   };
 }
 
+// estimateContainerPackageSize makes two kinds of real fetch() calls: one GET
+// to ghcr.io/token to mint a bearer token, then one GET per sampled version's
+// manifest, addressed directly by digest. Stubs globalThis.fetch for the
+// duration of the test and restores it afterward.
+function withMockedContainerFetch(manifestsByDigest, fn) {
+  return async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      if (typeof url === 'string' && url.startsWith('https://ghcr.io/token')) {
+        return new Response(JSON.stringify({ token: 'ghcr-token' }), { status: 200 });
+      }
+      if (typeof url === 'string' && url.includes('/manifests/')) {
+        const digest = url.split('/manifests/').pop();
+        const manifest = manifestsByDigest[digest];
+        if (!manifest) return new Response(null, { status: 404 });
+        return new Response(JSON.stringify(manifest), { status: 200 });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+
+    try {
+      await fn();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  };
+}
+
 test('lists packages across every package type and paginates their versions', withMockedNpmFetch({ '1.0.0': 1000 }, async () => {
   let versionsPage = 0;
   const analyzer = createPackagesAnalyzer({
@@ -256,7 +284,7 @@ test('tracks a package-type listing failure as a warning instead of aborting the
   assert.equal(result.summary.totalPackages, 0);
 });
 
-test('surfaces container version tags for later cleanup-marker detection', async () => {
+test('surfaces container version tags for later cleanup-marker detection', withMockedContainerFetch({}, async () => {
   let versionsPage = 0;
   const analyzer = createPackagesAnalyzer({
     packages: {
@@ -280,7 +308,7 @@ test('surfaces container version tags for later cleanup-marker detection', async
   const result = await analyzer.analyzePackages('my-org', { isOrg: true });
 
   assert.deepEqual(result.packages[0].versions[0].tags, ['0.0.1-SNAPSHOT']);
-});
+}));
 
 test('bounds concurrent package version collection to the configured limit', async () => {
   let inFlight = 0;
@@ -382,4 +410,73 @@ test('reports npm size as unknown when every sampled tarball lookup fails', asyn
   assert.equal(result.summary.byPackageType.npm.sizeKnown, false);
   assert.equal(result.incomplete, true);
   assert.match(result.warnings.join('; '), /Estimating size for npm package/);
+});
+
+// The sampling math and the container HTTP mechanics (ghcr.io token,
+// manifest fetching) are unit-tested independently in tests/sampling.test.mjs
+// and tests/container-registry-client.test.mjs. These two tests only verify
+// that analyzePackages wires a container package's real version list into
+// that estimator and applies its result correctly.
+test('estimates container package size from a sample of real manifest sizes, extrapolated to every version', withMockedContainerFetch(
+  { 'sha256:aaa': { config: { size: 100 }, layers: [{ size: 900 }] } }, // total 1000
+  async () => {
+    let versionsPage = 0;
+    const analyzer = createPackagesAnalyzer({
+      packages: {
+        listPackagesForOrganization: packagesFixture('container', [
+          {
+            name: 'microservice-app', visibility: 'private',
+            created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-02T00:00:00Z',
+          },
+        ]),
+        getAllPackageVersionsForPackageOwnedByOrg: async () => ({
+          data: versionsPage++ === 0
+            ? [{ id: 1, name: 'sha256:aaa', created_at: '2026-01-01T00:00:00Z' }]
+            : [],
+        }),
+      },
+    });
+
+    const result = await analyzer.analyzePackages('my-org', { isOrg: true });
+
+    assert.equal(result.packages[0].sizeBytes, 1000); // estimated from its one sampled version
+    assert.equal(result.packages[0].sizeEstimated, true);
+    assert.equal(result.packages[0].sampleCount, 1);
+    assert.equal(result.summary.byPackageType.container.sizeKnown, true);
+    assert.equal(result.summary.byPackageType.container.sizeEstimated, true);
+  }
+));
+
+test('reports container size as unknown when every sampled manifest lookup fails', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => { throw new Error('network unreachable'); };
+
+  let versionsPage = 0;
+  const analyzer = createPackagesAnalyzer({
+    packages: {
+      listPackagesForOrganization: packagesFixture('container', [
+        {
+          name: 'microservice-app', visibility: 'private',
+          created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-02T00:00:00Z',
+        },
+      ]),
+      getAllPackageVersionsForPackageOwnedByOrg: async () => ({
+        data: versionsPage++ === 0
+          ? [{ id: 1, name: 'sha256:aaa', created_at: '2026-01-01T00:00:00Z' }]
+          : [],
+      }),
+    },
+  });
+
+  let result;
+  try {
+    result = await analyzer.analyzePackages('my-org', { isOrg: true });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(result.packages[0].sizeBytes, null);
+  assert.equal(result.summary.byPackageType.container.sizeKnown, false);
+  assert.equal(result.incomplete, true);
+  assert.match(result.warnings.join('; '), /Estimating size for container package/);
 });

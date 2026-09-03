@@ -169,10 +169,11 @@ class ReportGenerator {
 
     if (summary.packagesWithUnknownSize > 0) {
       console.log(chalk.gray(
-        '\nNote: GitHub does not expose byte sizes for Docker/container, NuGet, or RubyGems ' +
-        'packages via any documented API. Maven sizes above are real byte counts; npm sizes ' +
-        'are estimated by sampling a subset of each package\'s versions and extrapolating ' +
-        '(marked "~"). Version counts are accurate for all types.'
+        '\nNote: GitHub does not expose byte sizes for Docker (legacy), NuGet, or RubyGems ' +
+        'packages via any documented API. Maven sizes above are real byte counts; npm and ' +
+        'container (Docker images and Helm charts) sizes are estimated by sampling a subset ' +
+        'of each package\'s versions and extrapolating (marked "~"). Version counts are ' +
+        'accurate for all types.'
       ));
     }
 
