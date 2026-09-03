@@ -848,7 +848,7 @@ test('honors an explicit --top 0 instead of falling back to the default of 10', 
   console.log = (...args) => logged.push(args.join(' '));
 
   try {
-    reporter.generateTableReport({
+    reporter.generateTopRepositoriesReport({
       incomplete: false,
       organizationName: null,
       summary: {

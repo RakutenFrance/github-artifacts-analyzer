@@ -2,6 +2,12 @@ import Table from 'cli-table3';
 import chalk from 'chalk';
 import { writeFileSync } from 'fs';
 import * as readline from 'readline';
+import { loadConfig } from './config.js';
+
+// GHCR container image/Helm chart storage is currently unmetered per
+// GitHub's docs - it draws from no quota today, unlike Actions artifacts
+// and every other package type, which share one Packages+Actions pool.
+const PACKAGE_TYPES_EXCLUDED_FROM_QUOTA = { container: true };
 
 class ReportGenerator {
   async generateReport(analysis, options, packagesAnalysis) {
@@ -14,8 +20,9 @@ class ReportGenerator {
         break;
       case 'table':
       default:
-        this.generateTableReport(analysis, options.topCount);
-        this.generatePackagesTableReport(packagesAnalysis);
+        this.generateStorageOverview(analysis, packagesAnalysis);
+        this.generateTopRepositoriesReport(analysis, options.topCount);
+        this.generateTopPackagesReport(packagesAnalysis);
         break;
     }
   }
@@ -35,90 +42,19 @@ class ReportGenerator {
     }
   }
 
-  generateTableReport(analysis, topCount) {
+  // Merges what used to be three separate tables (artifacts summary,
+  // packages summary, packages-by-type) into one Category/Packages/
+  // Artifacts/Storage view, plus an optional "% of quota" column. The quota
+  // is a configured assumption (github-artifacts-analyzer.config.json), not
+  // fetched - GitHub exposes no API for the real per-org/per-user limit.
+  // Container/GHCR storage is currently unmetered, so it's excluded from
+  // the quota column and from the quota-counted total.
+  generateStorageOverview(analysis, packagesAnalysis) {
     if (analysis.incomplete) {
       console.log(chalk.bold.red(
         '\n⚠ Incomplete analysis: some GitHub API requests failed. Totals below are partial.'
       ));
     }
-
-    // Summary table
-    const title = analysis.organizationName
-      ? `🚀 GitHub Artifacts Analysis - Organization: ${analysis.organizationName}`
-      : '🚀 GitHub Artifacts Storage Analysis Summary';
-
-    console.log(chalk.bold.blue(`\n${title}`));
-    console.log(chalk.gray('='.repeat(60)));
-
-    const summaryTable = new Table({
-      head: ['Metric', 'Value'],
-      style: { head: ['cyan'] }
-    });
-
-    summaryTable.push(
-      ['Total Repositories', analysis.summary.totalRepositories.toLocaleString()],
-      ['Repositories Skipped', (analysis.summary.repositoriesSkipped || 0).toLocaleString()],
-      ['Repositories Incomplete', (analysis.summary.repositoriesIncomplete || 0).toLocaleString()],
-      ['Repositories with Workflows', analysis.summary.repositoriesWithWorkflows.toLocaleString()],
-      ['Repositories with Artifacts', analysis.summary.repositoriesWithArtifacts.toLocaleString()],
-      ['Total Artifacts', analysis.summary.totalArtifacts.toLocaleString()],
-      ['Total Storage Used', this.formatBytes(analysis.summary.totalSizeBytes)],
-      ['Active Artifacts', `${analysis.summary.activeArtifacts.toLocaleString()} (${this.formatBytes(analysis.summary.activeSizeBytes)})`],
-      ['Expired Artifacts', `${analysis.summary.expiredArtifacts.toLocaleString()} (${this.formatBytes(analysis.summary.expiredSizeBytes)})`]
-    );
-
-    console.log(summaryTable.toString());
-
-    // Top repositories by storage
-    if (analysis.repositories.length > 0) {
-      console.log(chalk.bold.blue(`\n📊 Top ${topCount} Repositories by Storage Usage`));
-      console.log(chalk.gray('='.repeat(80)));
-
-      const topRepos = analysis.repositories
-        .filter(r => r.totalSizeBytes > 0)
-        .sort((a, b) => b.totalSizeBytes - a.totalSizeBytes)
-        .slice(0, topCount);
-
-      if (topRepos.length === 0) {
-        console.log(chalk.yellow('No repositories with artifacts found.'));
-        return;
-      }
-
-      const repoTable = new Table({
-        head: ['Repository', 'Workflows', 'Artifacts', 'Total Size', 'Active Size', 'Expired Size'],
-        style: { head: ['cyan'] },
-        colWidths: [30, 12, 12, 15, 15, 15]
-      });
-
-      for (const repo of topRepos) {
-        const sizeColor = repo.totalSizeBytes > 100 * 1024 * 1024 ? 'red' : repo.totalSizeBytes > 10 * 1024 * 1024 ? 'yellow' : 'white';
-        
-        repoTable.push([
-          repo.fullName,
-          repo.workflows.length.toString(),
-          repo.totalArtifacts.toString(),
-          chalk[sizeColor](this.formatBytes(repo.totalSizeBytes)),
-          this.formatBytes(repo.activeSizeBytes),
-          repo.expiredSizeBytes > 0 ? chalk.gray(this.formatBytes(repo.expiredSizeBytes)) : '0 B'
-        ]);
-      }
-
-      console.log(repoTable.toString());
-
-      // Show detailed artifacts for top repository
-      if (topRepos.length > 0 && topRepos[0].artifacts.length > 0) {
-        console.log(chalk.bold.blue(`\n🔍 Detailed Artifacts for ${topRepos[0].fullName}`));
-        console.log(chalk.gray('='.repeat(80)));
-
-        this.showArtifactDetails(topRepos[0].artifacts.slice(0, 20)); // Show top 20 artifacts
-      }
-
-      // Storage recommendations
-      this.generateRecommendations(analysis);
-    }
-  }
-
-  generatePackagesTableReport(packagesAnalysis) {
     if (packagesAnalysis.incomplete) {
       console.log(chalk.bold.red(
         '\n⚠ Incomplete packages analysis: some GitHub API requests failed. Totals below are partial.'
@@ -128,82 +64,201 @@ class ReportGenerator {
       }
     }
 
-    console.log(chalk.bold.blue('\n📦 GitHub Packages Storage'));
-    console.log(chalk.gray('='.repeat(60)));
+    const title = analysis.organizationName
+      ? `🚀 Storage Overview - Organization: ${analysis.organizationName}`
+      : '🚀 Storage Overview';
+    console.log(chalk.bold.blue(`\n${title}`));
+    console.log(chalk.gray('='.repeat(80)));
 
-    const { summary } = packagesAnalysis;
+    const quotaGB = analysis.organizationName
+      ? loadConfig().storageQuotaGB.organization
+      : loadConfig().storageQuotaGB.user;
+    const quotaBytes = quotaGB * 1024 * 1024 * 1024;
 
-    const summaryTable = new Table({
-      head: ['Metric', 'Value'],
+    const overviewTable = new Table({
+      head: ['Category', 'Packages', 'Artifacts', 'Storage', `% of ${quotaGB} GB quota`],
       style: { head: ['cyan'] }
     });
 
-    summaryTable.push(
-      ['Total Packages', summary.totalPackages.toLocaleString()],
-      ['Total Versions', summary.totalVersions.toLocaleString()],
-      ['Total Known Storage Used', this.formatBytes(summary.totalSizeBytes)],
-      ['Packages with Unknown Size', summary.packagesWithUnknownSize.toLocaleString()]
-    );
+    overviewTable.push([
+      'Actions Artifacts',
+      '',
+      analysis.summary.totalArtifacts.toLocaleString(),
+      this.formatBytes(analysis.summary.totalSizeBytes),
+      this.formatQuotaBar(analysis.summary.totalSizeBytes, quotaBytes)
+    ]);
 
-    console.log(summaryTable.toString());
+    let quotaCountedPackages = 0;
+    let quotaCountedBytes = analysis.summary.totalSizeBytes;
+    const { summary: packagesSummary } = packagesAnalysis;
 
-    console.log(chalk.bold.blue('\n📊 Packages by Type'));
-    console.log(chalk.gray('='.repeat(60)));
+    // Types with a size mechanism (exact or estimated) get their own row;
+    // types with no size signal at all are collapsed into one "other" row.
+    const typesWithSize = [];
+    const otherTypes = [];
+    for (const [packageType, stats] of Object.entries<any>(packagesSummary.byPackageType)) {
+      (stats.sizeKnown || stats.sizeEstimated ? typesWithSize : otherTypes).push(packageType);
+    }
 
-    const byTypeTable = new Table({
-      head: ['Type', 'Packages', 'Versions', 'Storage Used'],
-      style: { head: ['cyan'] }
-    });
-
-    for (const [packageType, stats] of Object.entries<any>(summary.byPackageType)) {
-      if (stats.packageCount === 0) continue;
-      byTypeTable.push([
-        packageType,
+    for (const packageType of typesWithSize) {
+      const stats = packagesSummary.byPackageType[packageType];
+      const countsTowardQuota = !(packageType in PACKAGE_TYPES_EXCLUDED_FROM_QUOTA);
+      if (countsTowardQuota) {
+        quotaCountedPackages += stats.packageCount;
+        quotaCountedBytes += stats.sizeBytes;
+      }
+      overviewTable.push([
+        `Packages: ${packageType}`,
         stats.packageCount.toLocaleString(),
-        stats.versionCount.toLocaleString(),
-        this.formatPackageTypeSize(stats)
+        '',
+        this.formatPackageTypeSize(stats),
+        countsTowardQuota
+          ? this.formatQuotaBar(stats.sizeBytes, quotaBytes)
+          : chalk.gray('(excluded - GHCR is unmetered)')
       ]);
     }
 
-    console.log(byTypeTable.toString());
+    const otherPackageCount = otherTypes.reduce((sum, t) => sum + packagesSummary.byPackageType[t].packageCount, 0);
+    quotaCountedPackages += otherPackageCount;
+    overviewTable.push([
+      `Packages: ${otherTypes.join('/')}`,
+      otherPackageCount.toLocaleString(),
+      '',
+      chalk.gray('—'),
+      ''
+    ]);
 
-    if (summary.packagesWithUnknownSize > 0) {
+    const totalPackages = packagesSummary.totalPackages;
+    const totalStorageBytes = analysis.summary.totalSizeBytes + packagesSummary.totalSizeBytes;
+
+    overviewTable.push([
+      chalk.bold('Total (all categories)'),
+      chalk.bold(totalPackages.toLocaleString()),
+      chalk.bold(analysis.summary.totalArtifacts.toLocaleString()),
+      chalk.bold(this.formatBytes(totalStorageBytes)),
+      ''
+    ]);
+    overviewTable.push([
+      chalk.bold('Total (counts toward quota)'),
+      chalk.bold(quotaCountedPackages.toLocaleString()),
+      chalk.bold(analysis.summary.totalArtifacts.toLocaleString()),
+      chalk.bold(this.formatBytes(quotaCountedBytes)),
+      chalk.bold(this.formatQuotaBar(quotaCountedBytes, quotaBytes))
+    ]);
+
+    console.log(overviewTable.toString());
+
+    console.log(chalk.gray(
+      `\nNote: quota is a configured assumption (github-artifacts-analyzer.config.json), not fetched ` +
+      `from GitHub - no API currently exposes the real per-org/per-user limit. Container/GHCR storage ` +
+      `doesn't count against the Packages+Actions quota (currently unmetered) and is excluded above.`
+    ));
+
+    if (packagesSummary.packagesWithUnknownSize > 0) {
       console.log(chalk.gray(
-        '\nNote: GitHub does not expose byte sizes for Docker (legacy), NuGet, or RubyGems ' +
-        'packages via any documented API. Maven sizes above are real byte counts; npm and ' +
-        'container (Docker images and Helm charts) sizes are estimated by sampling a subset ' +
-        'of each package\'s versions and extrapolating (marked "~"). Version counts are ' +
-        'accurate for all types.'
+        'Note: GitHub does not expose byte sizes for Docker (legacy), NuGet, or RubyGems packages via any ' +
+        'documented API. Maven sizes are real byte counts; npm and container (Docker images and Helm ' +
+        'charts) sizes are estimated by sampling a subset of each package\'s versions and extrapolating ' +
+        '(marked "~").'
       ));
     }
+  }
 
-    const topByVersions = packagesAnalysis.packages
-      .slice()
-      .sort((a, b) => b.versions.length - a.versions.length)
-      .slice(0, 10)
-      .filter(pkg => pkg.versions.length > 0);
+  // Renders a small inline bar + percentage for how much of the quota one
+  // category uses. Falls back to a plain percentage with no bar past 100%
+  // rather than truncating/wrapping a bar that would otherwise overflow.
+  formatQuotaBar(bytes, quotaBytes, width = 20) {
+    if (quotaBytes <= 0) return chalk.gray('n/a');
 
-    if (topByVersions.length > 0) {
-      console.log(chalk.bold.blue('\n📊 Top Packages by Version Count'));
-      console.log(chalk.gray('='.repeat(60)));
+    const fraction = bytes / quotaBytes;
+    const percentLabel = `${Math.round(fraction * 100)}%`;
 
-      const topTable = new Table({
-        head: ['Package', 'Type', 'Repository', 'Versions', 'Size'],
-        style: { head: ['cyan'] }
-      });
-
-      for (const pkg of topByVersions) {
-        topTable.push([
-          pkg.name,
-          pkg.packageType,
-          pkg.repositoryFullName || chalk.gray('unknown'),
-          pkg.versions.length.toLocaleString(),
-          this.formatPackageSize(pkg)
-        ]);
-      }
-
-      console.log(topTable.toString());
+    if (fraction > 1) {
+      return `${percentLabel} (over quota)`;
     }
+
+    const filled = Math.round(fraction * width);
+    const bar = '█'.repeat(filled) + '░'.repeat(width - filled);
+    return `${bar} ${percentLabel}`;
+  }
+
+  generateTopRepositoriesReport(analysis, topCount) {
+    if (analysis.repositories.length === 0) return;
+
+    console.log(chalk.bold.blue(`\n📊 Top ${topCount} Repositories by Storage Usage`));
+    console.log(chalk.gray('='.repeat(80)));
+
+    const topRepos = analysis.repositories
+      .filter(r => r.totalSizeBytes > 0)
+      .sort((a, b) => b.totalSizeBytes - a.totalSizeBytes)
+      .slice(0, topCount);
+
+    if (topRepos.length === 0) {
+      console.log(chalk.yellow('No repositories with artifacts found.'));
+      return;
+    }
+
+    const repoTable = new Table({
+      head: ['Repository', 'Workflows', 'Artifacts', 'Total Size', 'Active Size', 'Expired Size'],
+      style: { head: ['cyan'] },
+      colWidths: [30, 12, 12, 15, 15, 15]
+    });
+
+    for (const repo of topRepos) {
+      const sizeColor = repo.totalSizeBytes > 100 * 1024 * 1024 ? 'red' : repo.totalSizeBytes > 10 * 1024 * 1024 ? 'yellow' : 'white';
+
+      repoTable.push([
+        repo.fullName,
+        repo.workflows.length.toString(),
+        repo.totalArtifacts.toString(),
+        chalk[sizeColor](this.formatBytes(repo.totalSizeBytes)),
+        this.formatBytes(repo.activeSizeBytes),
+        repo.expiredSizeBytes > 0 ? chalk.gray(this.formatBytes(repo.expiredSizeBytes)) : '0 B'
+      ]);
+    }
+
+    console.log(repoTable.toString());
+
+    // Show detailed artifacts for top repository
+    if (topRepos.length > 0 && topRepos[0].artifacts.length > 0) {
+      console.log(chalk.bold.blue(`\n🔍 Detailed Artifacts for ${topRepos[0].fullName}`));
+      console.log(chalk.gray('='.repeat(80)));
+
+      this.showArtifactDetails(topRepos[0].artifacts.slice(0, 20)); // Show top 20 artifacts
+    }
+
+    // Storage recommendations
+    this.generateRecommendations(analysis);
+  }
+
+  generateTopPackagesReport(packagesAnalysis) {
+    const topBySize = packagesAnalysis.packages
+      .filter(pkg => pkg.sizeBytes !== null)
+      .slice()
+      .sort((a, b) => b.sizeBytes - a.sizeBytes)
+      .slice(0, 10);
+
+    if (topBySize.length === 0) return;
+
+    console.log(chalk.bold.blue('\n📊 Top 10 Packages by Storage Used'));
+    console.log(chalk.gray('='.repeat(60)));
+
+    const topTable = new Table({
+      head: ['Package', 'Type', 'Repository', 'Versions', 'Size'],
+      style: { head: ['cyan'] }
+    });
+
+    for (const pkg of topBySize) {
+      topTable.push([
+        pkg.name,
+        pkg.packageType,
+        pkg.repositoryFullName || chalk.gray('unknown'),
+        pkg.versions.length.toLocaleString(),
+        this.formatPackageSize(pkg)
+      ]);
+    }
+
+    console.log(topTable.toString());
   }
 
   formatPackageTypeSize(stats) {
