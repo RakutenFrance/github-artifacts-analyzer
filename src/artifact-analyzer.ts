@@ -147,9 +147,6 @@ class GitHubArtifactsAnalyzer extends GitHubClient {
         skippedRepositories.push({ fullName: repo.full_name, reason });
         console.log(chalk.yellow(`    ⚠ Skipped (${reason})`));
       }
-
-      // Small delay to be respectful to the API
-      await this.sleep(100);
     }
 
     return { repositories, skippedRepositories };

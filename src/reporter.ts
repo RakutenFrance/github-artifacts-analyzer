@@ -616,7 +616,6 @@ class ReportGenerator {
           } else {
             console.log(chalk.red('✗'));
           }
-          await analyzer.sleep(250); // Rate limit protection
         }
         console.log(chalk.green(`✅ Deleted ${deleted}/${expiredArtifacts.length} expired artifacts`));
       }
@@ -655,7 +654,6 @@ class ReportGenerator {
           } else {
             console.log(chalk.red('✗'));
           }
-          await analyzer.sleep(250); // Rate limit protection
         }
         console.log(chalk.green(`✅ Deleted ${deleted}/${oldActiveArtifacts.length} old artifacts`));
       }
