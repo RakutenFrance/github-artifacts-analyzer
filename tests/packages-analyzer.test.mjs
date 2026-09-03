@@ -1,10 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import {
-  GitHubPackagesAnalyzer, PACKAGE_TYPES, VERSION_COLLECTION_CONCURRENCY,
-  sampleSizeFor, pickVersionsToSample,
-} from '../dist/packages-analyzer.js';
+import { GitHubPackagesAnalyzer, PACKAGE_TYPES, VERSION_COLLECTION_CONCURRENCY } from '../dist/packages-analyzer.js';
 
 // listPackagesForOrganization/listPackagesForUser require a package_type
 // filter and don't accept "all" - the analyzer loops over every known
@@ -312,34 +309,11 @@ test('bounds concurrent package version collection to the configured limit', asy
   assert.ok(maxInFlight > 1); // proves version collection actually ran concurrently, not serially
 });
 
-test('sampleSizeFor scales log2, staying within the configured min/max bounds', () => {
-  assert.equal(sampleSizeFor(0), 0);
-  assert.equal(sampleSizeFor(1), 1);
-  assert.equal(sampleSizeFor(3), 3); // at/below the minimum: sample everything
-  assert.equal(sampleSizeFor(4), 3); // log2(4) = 2, floored up to the minimum of 3
-  assert.equal(sampleSizeFor(100), 7); // ceil(log2(100)) = 7
-  assert.equal(sampleSizeFor(1024), 10); // ceil(log2(1024)) = 10, at the max
-  assert.equal(sampleSizeFor(1_000_000), 10); // never exceeds the configured max
-});
-
-test('pickVersionsToSample always includes the latest version and samples the rest', () => {
-  const versions = Array.from({ length: 10 }, (_, i) => ({ name: `v${i}` }));
-
-  const sample = pickVersionsToSample(versions, 4);
-
-  assert.equal(sample.length, 4);
-  assert.equal(sample[0], versions[0]); // latest (first in the array) always included
-  assert.equal(new Set(sample.map(v => v.name)).size, 4); // no duplicates
-});
-
-test('pickVersionsToSample returns every version when there are fewer than the sample size', () => {
-  const versions = [{ name: 'v0' }, { name: 'v1' }];
-
-  const sample = pickVersionsToSample(versions, 5);
-
-  assert.deepEqual(sample, versions);
-});
-
+// The sampling math (sampleSizeFor/pickItemsToSample) and the npm HTTP
+// mechanics (redirect-chasing, HEAD requests) are unit-tested independently
+// in tests/sampling.test.mjs and tests/npm-registry-client.test.mjs. These
+// two tests only verify that analyzePackages wires an npm package's real
+// version list into that estimator and applies its result correctly.
 test('estimates npm package size from a sample of real tarball sizes, extrapolated to every version', withMockedNpmFetch(
   { '3.0.0': 1000, '2.0.0': 2000, '1.0.0': 3000 },
   async () => {
@@ -366,7 +340,7 @@ test('estimates npm package size from a sample of real tarball sizes, extrapolat
 
     const result = await analyzer.analyzePackages('my-org', { isOrg: true });
 
-    // 3 versions <= NPM_SIZE_SAMPLE_MIN, so every version is sampled:
+    // 3 versions is at the sample-everything threshold, so all 3 are sampled:
     // average(1000, 2000, 3000) * 3 versions = 6000.
     assert.equal(result.packages[0].sizeBytes, 6000);
     assert.equal(result.packages[0].sizeEstimated, true);
